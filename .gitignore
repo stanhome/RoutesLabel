@@ -1,0 +1,27 @@
+# Build output
+build/
+build-*/
+out/
+cmake-build-*/
+
+# Compiled shaders (generated at build time)
+*.spv
+
+# Python venv (project rules)
+.venv/
+
+# Editor / IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# macOS
+.DS_Store
+
+# Temporary working directory (project rules)
+tmp/
+
+# Misc
+*.log
