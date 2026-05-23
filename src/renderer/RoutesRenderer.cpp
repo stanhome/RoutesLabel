@@ -27,7 +27,7 @@ namespace routes_label::renderer {
 
 namespace {
 
-constexpr float kRibbonWidthPx = 6.0f;
+constexpr float kRibbonWidthPx = 8.0f;
 
 struct UboGlobals {
     glm::mat4 projection;
