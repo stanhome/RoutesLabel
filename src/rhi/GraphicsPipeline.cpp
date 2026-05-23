@@ -9,11 +9,10 @@ namespace routes_label::rhi {
 
 GraphicsPipeline::GraphicsPipeline(const Device& device,
                                    const RenderPass& render_pass,
-                                   const std::filesystem::path& vert_spv,
-                                   const std::filesystem::path& frag_spv)
+                                   const GraphicsPipelineDesc& desc)
     : device_(device) {
-    ShaderModule vert(device_, vert_spv);
-    ShaderModule frag(device_, frag_spv);
+    ShaderModule vert(device_, desc.vert_spv);
+    ShaderModule frag(device_, desc.frag_spv);
 
     VkPipelineShaderStageCreateInfo stages[2] = {};
     stages[0].sType  = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
@@ -25,13 +24,19 @@ GraphicsPipeline::GraphicsPipeline(const Device& device,
     stages[1].module = frag.handle();
     stages[1].pName  = "main";
 
-    // 首期不用 vertex buffer，所有顶点信息硬编码在 vert shader（gl_VertexIndex）
     VkPipelineVertexInputStateCreateInfo vi = {};
-    vi.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
+    vi.sType                         = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
+    vi.vertexBindingDescriptionCount = static_cast<uint32_t>(desc.vertex_bindings.size());
+    vi.pVertexBindingDescriptions    = desc.vertex_bindings.empty()
+                                       ? nullptr : desc.vertex_bindings.data();
+    vi.vertexAttributeDescriptionCount = static_cast<uint32_t>(desc.vertex_attributes.size());
+    vi.pVertexAttributeDescriptions    = desc.vertex_attributes.empty()
+                                       ? nullptr : desc.vertex_attributes.data();
 
     VkPipelineInputAssemblyStateCreateInfo ia = {};
-    ia.sType    = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
-    ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+    ia.sType                  = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
+    ia.topology               = desc.topology;
+    ia.primitiveRestartEnable = desc.primitive_restart;
 
     // viewport / scissor 改为 dynamic state，避免 swapchain 重建时重建 pipeline
     VkPipelineViewportStateCreateInfo vp = {};
@@ -68,7 +73,10 @@ GraphicsPipeline::GraphicsPipeline(const Device& device,
     dyn.pDynamicStates    = dyn_states;
 
     VkPipelineLayoutCreateInfo lci = {};
-    lci.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+    lci.sType          = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+    lci.setLayoutCount = static_cast<uint32_t>(desc.descriptor_set_layouts.size());
+    lci.pSetLayouts    = desc.descriptor_set_layouts.empty()
+                       ? nullptr : desc.descriptor_set_layouts.data();
     VK_CHECK(vkCreatePipelineLayout(device_.handle(), &lci, nullptr, &layout_));
 
     VkGraphicsPipelineCreateInfo pci = {};
@@ -88,7 +96,9 @@ GraphicsPipeline::GraphicsPipeline(const Device& device,
 
     VK_CHECK(vkCreateGraphicsPipelines(device_.handle(), VK_NULL_HANDLE,
                                        1, &pci, nullptr, &pipeline_));
-    LOG_INFO("[GraphicsPipeline] created (triangle, dynamic viewport/scissor)");
+    LOG_INFO("[GraphicsPipeline] created (topology=" << desc.topology
+             << ", restart=" << desc.primitive_restart
+             << ", set_layouts=" << desc.descriptor_set_layouts.size() << ")");
 }
 
 GraphicsPipeline::~GraphicsPipeline() {

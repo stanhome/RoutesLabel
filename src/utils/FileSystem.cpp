@@ -52,4 +52,8 @@ std::filesystem::path executable_dir() {
 #endif
 }
 
+std::filesystem::path assets_dir() {
+    return executable_dir() / "assets";
+}
+
 }  // namespace routes_label::utils

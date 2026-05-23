@@ -16,4 +16,8 @@ std::vector<char> read_binary_file(const std::filesystem::path& path);
 // 解析当前可执行文件所在目录（mac/Linux 各自实现）。
 std::filesystem::path executable_dir();
 
+// 资产根目录：与 executable_dir() 同级的 assets/ 子目录。
+// CMake POST_BUILD 把 source assets/ 拷贝到 ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/assets。
+std::filesystem::path assets_dir();
+
 }  // namespace routes_label::utils

@@ -1,7 +1,7 @@
 #include "app/Application.h"
 
 #include "platform/Window.h"
-#include "renderer/TriangleRenderer.h"
+#include "renderer/RoutesRenderer.h"
 #include "rhi/Device.h"
 #include "rhi/Instance.h"
 #include "rhi/PhysicalDevice.h"
@@ -14,7 +14,7 @@ namespace routes_label::app {
 namespace {
 constexpr uint32_t kInitWidth  = 1280;
 constexpr uint32_t kInitHeight = 720;
-constexpr const char* kTitle   = "RoutesLabel - Triangle Demo";
+constexpr const char* kTitle   = "RoutesLabel - Routes Demo";
 
 #if defined(ROUTES_ENABLE_VALIDATION) && ROUTES_ENABLE_VALIDATION
 constexpr bool kEnableValidation = true;
@@ -43,7 +43,7 @@ void Application::init() {
     physical_ = std::make_unique<rhi::PhysicalDevice>(instance_->handle(), surface_);
     device_   = std::make_unique<rhi::Device>(*physical_, instance_->validation_enabled());
 
-    renderer_ = std::make_unique<renderer::TriangleRenderer>(
+    renderer_ = std::make_unique<renderer::RoutesRenderer>(
         *instance_, *physical_, *device_, *window_, surface_);
 
     LOG_INFO("[Application] initialized");

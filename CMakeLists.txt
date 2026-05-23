@@ -69,6 +69,43 @@ add_subdirectory(third_party/glfw EXCLUDE_FROM_ALL)
 # GLM（git submodule，header-only）
 add_subdirectory(third_party/glm EXCLUDE_FROM_ALL)
 
+# nlohmann/json（git submodule，header-only）
+set(JSON_BuildTests        OFF CACHE INTERNAL "" FORCE)
+set(JSON_Install           OFF CACHE INTERNAL "" FORCE)
+set(JSON_MultipleHeaders   OFF CACHE INTERNAL "" FORCE)
+add_subdirectory(third_party/json EXCLUDE_FROM_ALL)
+
+# Dear ImGui（git submodule，源码以 STATIC 库聚合）
+# 仅编译 6 个核心 + 2 个后端 cpp。imgui_demo 用于调试期参考，可保留也可移除。
+set(IMGUI_DIR ${CMAKE_CURRENT_SOURCE_DIR}/third_party/imgui)
+add_library(imgui_lib STATIC
+    ${IMGUI_DIR}/imgui.cpp
+    ${IMGUI_DIR}/imgui_draw.cpp
+    ${IMGUI_DIR}/imgui_tables.cpp
+    ${IMGUI_DIR}/imgui_widgets.cpp
+    ${IMGUI_DIR}/imgui_demo.cpp
+    ${IMGUI_DIR}/backends/imgui_impl_vulkan.cpp
+    ${IMGUI_DIR}/backends/imgui_impl_glfw.cpp
+)
+# 让 imgui 头文件以 SYSTEM 形式暴露给依赖方，自动屏蔽 -Wall/-Wextra/-Wpedantic
+# 引发的 imgui 内部告警，主项目仍保持严格开关。
+target_include_directories(imgui_lib SYSTEM PUBLIC
+    ${IMGUI_DIR}
+    ${IMGUI_DIR}/backends
+)
+target_link_libraries(imgui_lib PUBLIC
+    Vulkan::Vulkan
+)
+target_link_libraries(imgui_lib PRIVATE
+    glfw
+)
+# imgui 自身源在某些 Clang 版本下可能产生少量告警，关闭以保证主目标 0 warning
+target_compile_options(imgui_lib PRIVATE
+    $<$<OR:$<CXX_COMPILER_ID:Clang>,$<CXX_COMPILER_ID:AppleClang>,$<CXX_COMPILER_ID:GNU>>:
+        -w
+    >
+)
+
 # Shader 编译辅助函数
 include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/CompileShaders.cmake)
 
@@ -93,11 +130,18 @@ add_executable(routes_label
     src/rhi/GraphicsPipeline.cpp
     src/rhi/CommandPool.cpp
     src/rhi/FrameSync.cpp
+    src/rhi/Buffer.cpp
+    src/rhi/Descriptor.cpp
 
-    src/renderer/TriangleRenderer.cpp
+    src/renderer/RouteScene.cpp
+    src/renderer/RoutesRenderer.cpp
+
+    src/debug/DebugOverlay.cpp
+    src/debug/FpsWidget.cpp
 
     src/utils/Log.cpp
     src/utils/FileSystem.cpp
+    src/utils/Json.cpp
 )
 
 target_include_directories(routes_label PRIVATE
@@ -108,6 +152,8 @@ target_link_libraries(routes_label PRIVATE
     Vulkan::Vulkan
     glfw
     glm::glm
+    nlohmann_json::nlohmann_json
+    imgui_lib
 )
 
 target_compile_options(routes_label PRIVATE
@@ -125,8 +171,19 @@ target_compile_definitions(routes_label PRIVATE
 # -----------------------------------------------------------------------------
 routes_compile_shaders(routes_label
     SHADERS
-        ${CMAKE_CURRENT_SOURCE_DIR}/shaders/triangle.vert
-        ${CMAKE_CURRENT_SOURCE_DIR}/shaders/triangle.frag
+        ${CMAKE_CURRENT_SOURCE_DIR}/shaders/routes.vert
+        ${CMAKE_CURRENT_SOURCE_DIR}/shaders/routes.frag
     OUTPUT_DIR
         ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/shaders
+)
+
+# -----------------------------------------------------------------------------
+# Assets：把 source assets/ 拷贝到 build/bin/assets/，与 shader 同级目录布局
+# -----------------------------------------------------------------------------
+add_custom_command(TARGET routes_label POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_directory
+        ${CMAKE_CURRENT_SOURCE_DIR}/assets
+        ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/assets
+    COMMENT "[RoutesLabel] copying assets/ to runtime dir"
+    VERBATIM
 )

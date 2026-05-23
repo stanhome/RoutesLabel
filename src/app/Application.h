@@ -12,7 +12,7 @@ class Instance;
 class PhysicalDevice;
 class Device;
 }
-namespace routes_label::renderer { class TriangleRenderer; }
+namespace routes_label::renderer { class RoutesRenderer; }
 
 struct VkSurfaceKHR_T;
 typedef VkSurfaceKHR_T* VkSurfaceKHR;
@@ -38,7 +38,7 @@ private:
     VkSurfaceKHR                               surface_  = nullptr;
     std::unique_ptr<rhi::PhysicalDevice>       physical_;
     std::unique_ptr<rhi::Device>               device_;
-    std::unique_ptr<renderer::TriangleRenderer> renderer_;
+    std::unique_ptr<renderer::RoutesRenderer>  renderer_;
 };
 
 }  // namespace routes_label::app

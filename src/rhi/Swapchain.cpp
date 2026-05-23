@@ -22,7 +22,14 @@ VkSurfaceFormatKHR choose_surface_format(const std::vector<VkSurfaceFormatKHR>& 
 }
 
 VkPresentModeKHR choose_present_mode(const std::vector<VkPresentModeKHR>& available) {
-    // 优先 MAILBOX（低延迟），否则 FIFO（必有）
+    // 不限帧策略：
+    //   1) IMMEDIATE：把已渲染图像立即送显示器，撕裂但完全不限帧（GPU 跑多快显示多快）；
+    //   2) MAILBOX：三缓冲，过期帧自动丢弃，无撕裂但仍受 vblank 节奏（macOS/MoltenVK 不一定支持）；
+    //   3) FIFO：标准 vsync，等 vblank，必然限帧到刷新率，作为兜底。
+    // RoutesLabel 是性能基准 demo，要"跑出最高性能"，因此 IMMEDIATE 优先。
+    for (auto m : available) {
+        if (m == VK_PRESENT_MODE_IMMEDIATE_KHR) return m;
+    }
     for (auto m : available) {
         if (m == VK_PRESENT_MODE_MAILBOX_KHR) return m;
     }
