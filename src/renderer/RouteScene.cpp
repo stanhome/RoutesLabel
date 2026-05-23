@@ -144,4 +144,20 @@ RibbonMesh RouteScene::build_ribbon_mesh(float line_width_px) const {
     return mesh;
 }
 
+algo::Polylines RouteScene::to_algo_polylines() const {
+    algo::Polylines out;
+    const size_t n = std::min<size_t>(algo::kRouteCount, data_.routes.size());
+    for (size_t i = 0; i < n; ++i) {
+        const auto& poly = data_.routes[i].polyline;
+        out.routes[i].reserve(poly.size());
+        for (const auto& p : poly) {
+            out.routes[i].push_back({
+                static_cast<float>(p.x),
+                static_cast<float>(p.y),
+            });
+        }
+    }
+    return out;
+}
+
 }  // namespace routes_label::renderer

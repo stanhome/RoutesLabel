@@ -11,6 +11,7 @@
 //   - DebugOverlay / FpsWidget：debug HUD，复用 RoutesRenderer 的 VkRenderPass。
 //
 
+#include "algo/GridCommon.h"
 #include "platform/Window.h"
 #include "renderer/RouteScene.h"
 #include "rhi/Buffer.h"
@@ -35,9 +36,15 @@ class DescriptorPool;
 class DescriptorSets;
 }  // namespace routes_label::rhi
 
+namespace routes_label::algo {
+class GridCpu;
+}  // namespace routes_label::algo
+
 namespace routes_label::debug {
 class DebugOverlay;
 class FpsWidget;
+class LabelWidget;
+class GridDebugWidget;
 }  // namespace routes_label::debug
 
 namespace routes_label::renderer {
@@ -71,6 +78,9 @@ private:
     void update_ubo_for_frame(uint32_t frame_index, VkExtent2D extent);
     void record_command_buffer(VkCommandBuffer cmd, uint32_t image_index);
 
+    // 在主线程更新 algo state（事件驱动：屏幕变化 / 参数变化时调用）。
+    void recompute_label_layout(VkExtent2D extent);
+
     rhi::Instance&        instance_;
     rhi::PhysicalDevice&  physical_;
     rhi::Device&          device_;
@@ -100,6 +110,14 @@ private:
     // Debug HUD（imgui 容器 + 各 widget）；析构在主资源之前完成 wait_idle + shutdown
     std::unique_ptr<debug::DebugOverlay>      overlay_;
     std::unique_ptr<debug::FpsWidget>         fps_widget_;
+
+    // Routes-Select Grid 算法状态（doc/routes-select-grid-gpu.md 阶段 1：CPU 实现）
+    std::unique_ptr<algo::GridCpu>            grid_cpu_;
+    std::unique_ptr<RouteScene>               scene_;            // 持有原始 polyline，用于事件驱动重算
+    algo::GridResult                          grid_result_;
+    std::unique_ptr<debug::LabelWidget>       label_widget_;
+    std::unique_ptr<debug::GridDebugWidget>   grid_widget_;
+    VkExtent2D                                last_extent_       = { 0, 0 };
 };
 
 }  // namespace routes_label::renderer

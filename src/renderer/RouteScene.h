@@ -8,6 +8,7 @@
 // 一次 vkCmdDrawIndexed 渲染所有 ribbon。
 //
 
+#include "algo/GridCommon.h"
 #include "core/Types.h"
 
 #include <cstdint>
@@ -37,6 +38,10 @@ public:
     // 把所有 routes 的 polyline 展开为单一 triangle-strip ribbon mesh。
     // line_width_px 是 ribbon 的总宽度（左右各 halfWidth）。
     RibbonMesh build_ribbon_mesh(float line_width_px) const;
+
+    // 把场景的前 3 条路径转成 algo::Polylines（屏幕像素，float）。
+    // 用于 algo::GridCpu 的输入。如果路径数 < 3，剩余的 routes 数组为空。
+    algo::Polylines to_algo_polylines() const;
 
 private:
     core::RouteSceneData data_;

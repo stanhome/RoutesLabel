@@ -1,7 +1,10 @@
 #include "renderer/RoutesRenderer.h"
 
+#include "algo/GridCpu.h"
 #include "debug/DebugOverlay.h"
 #include "debug/FpsWidget.h"
+#include "debug/GridDebugWidget.h"
+#include "debug/LabelWidget.h"
 #include "renderer/RouteScene.h"
 #include "rhi/CommandPool.h"
 #include "rhi/Descriptor.h"
@@ -20,6 +23,9 @@
 #include <glm/glm.hpp>
 #include <glm/gtc/matrix_transform.hpp>
 
+#include <imgui.h>
+
+#include <algorithm>
 #include <cstring>
 #include <stdexcept>
 
@@ -73,8 +79,12 @@ RoutesRenderer::RoutesRenderer(rhi::Instance& instance,
 RoutesRenderer::~RoutesRenderer() {
     device_.wait_idle();
     // 先释放 debug overlay（内部还会 wait_idle 一次，安全）
+    grid_widget_.reset();
+    label_widget_.reset();
     fps_widget_.reset();
     overlay_.reset();
+    grid_cpu_.reset();
+    scene_.reset();
 
     pipeline_.reset();
     desc_sets_.reset();
@@ -166,8 +176,8 @@ void RoutesRenderer::recreate_swapchain() {
 void RoutesRenderer::load_scene_and_upload() {
     const auto json_path = utils::assets_dir() / "routes_demo.json";
     auto data = utils::load_route_scene_from_json(json_path);
-    RouteScene scene(std::move(data));
-    const RibbonMesh mesh = scene.build_ribbon_mesh(kRibbonWidthPx);
+    scene_ = std::make_unique<RouteScene>(std::move(data));
+    const RibbonMesh mesh = scene_->build_ribbon_mesh(kRibbonWidthPx);
 
     if (mesh.vertices.empty() || mesh.indices.empty()) {
         throw std::runtime_error("[RoutesRenderer] empty ribbon mesh");
@@ -268,6 +278,29 @@ void RoutesRenderer::create_debug_overlay() {
         render_pass_->handle(),
         swapchain_->image_count());
     fps_widget_ = std::make_unique<debug::FpsWidget>();
+
+    // Routes-Select Grid 算法（CPU 阶段 1，doc/routes-select-grid-gpu.md §7）
+    grid_cpu_     = std::make_unique<algo::GridCpu>();
+    label_widget_ = std::make_unique<debug::LabelWidget>();
+    grid_widget_  = std::make_unique<debug::GridDebugWidget>();
+
+    // 把场景配色传给 label widget
+    if (scene_) {
+        std::array<std::array<float, 3>, algo::kRouteCount> colors{};
+        const auto& styles = scene_->data().styles;
+        for (size_t i = 0; i < algo::kRouteCount && i < styles.size(); ++i) {
+            colors[i][0] = styles[i].color[0];
+            colors[i][1] = styles[i].color[1];
+            colors[i][2] = styles[i].color[2];
+        }
+        label_widget_->SetRouteColors(colors);
+    }
+
+    // 初始化 grid 参数（屏幕尺寸由 recompute 时填充）
+    algo::GridParams p_init{};
+    p_init.screen_w = static_cast<float>(swapchain_->extent().width);
+    p_init.screen_h = static_cast<float>(swapchain_->extent().height);
+    grid_widget_->InitParams(p_init);
 }
 
 // -----------------------------------------------------------------------------
@@ -283,6 +316,53 @@ void RoutesRenderer::update_ubo_for_frame(uint32_t frame_index, VkExtent2D exten
         0.0f, static_cast<float>(extent.height),
         -1.0f, 1.0f);
     std::memcpy(ubo_per_frame_[frame_index].mapped(), &u, sizeof(UboGlobals));
+}
+
+// -----------------------------------------------------------------------------
+// Routes-Select Grid 算法重算（事件驱动）
+// 触发条件：屏幕尺寸变化 / 调试参数变化 / 首次启动。
+// -----------------------------------------------------------------------------
+
+void RoutesRenderer::recompute_label_layout(VkExtent2D extent) {
+    if (!grid_cpu_ || !scene_ || !grid_widget_) return;
+
+    const float w = static_cast<float>(extent.width);
+    const float h = static_cast<float>(extent.height);
+    grid_widget_->UpdateScreen(w, h);
+
+    const bool dirty = grid_widget_->dirty_and_clear();
+    const bool extent_changed = (extent.width  != last_extent_.width
+                              || extent.height != last_extent_.height);
+    if (!dirty && !extent_changed && grid_result_.compute_ms > 0.0f) {
+        return;   // 没事件，无需重算
+    }
+    last_extent_ = extent;
+
+    algo::GridParams params = grid_widget_->params_overrides();
+    params.screen_w = w;
+    params.screen_h = h;
+
+    // 把调试面板（logical px）作为 obstructing rect 注入算法（fb px，与 polyline 同坐标系）
+    const auto pr = grid_widget_->panel_rect_logical();
+    if (pr.valid) {
+        // ImGui DisplaySize 是 logical px；framebuffer extent 是 fb px。两者比例 = scale。
+        const float sx = (pr.w > 0.0f) ? (w  / std::max(1.0f, ImGui::GetIO().DisplaySize.x)) : 1.0f;
+        const float sy = (pr.h > 0.0f) ? (h  / std::max(1.0f, ImGui::GetIO().DisplaySize.y)) : 1.0f;
+        algo::AABBf bb;
+        bb.mn.x = pr.x * sx;
+        bb.mn.y = pr.y * sy;
+        bb.mx.x = (pr.x + pr.w) * sx;
+        bb.mx.y = (pr.y + pr.h) * sy;
+        params.panel_rect = bb;
+    } else {
+        params.panel_rect = algo::AABBf{};
+    }
+
+    const algo::Polylines polys = scene_->to_algo_polylines();
+    grid_result_ = grid_cpu_->compute(polys, params, /*collect_debug=*/true);
+
+    grid_widget_->SetSnapshot(grid_result_.debug);
+    grid_widget_->SetComputeMs(grid_result_.compute_ms);
 }
 
 // -----------------------------------------------------------------------------
@@ -353,14 +433,44 @@ void RoutesRenderer::record_command_buffer(VkCommandBuffer cmd, uint32_t image_i
 // -----------------------------------------------------------------------------
 
 void RoutesRenderer::draw_frame() {
-    // ---- Debug HUD: 帧开始 + widgets 更新（在录制 cmd 之前完成 ImGui::Render）----
+    // ---- Debug HUD: 帧开始 ----
+    // 设计顺序（关键）：
+    //   1. begin_frame
+    //   2. fps_widget + grid_widget 渲染 panel（在 Begin/End 内取本帧实际 rect）
+    //   3. recompute_label_layout：把 panel rect 作为 obstructing rect 注入 GridParams，
+    //      在事件驱动条件下重算 label 摆放（用本帧 panel rect，零延迟）
+    //   4. label_widget 渲染（用刚算出的 label_center / leader）
+    //   5. end_frame
+    // 这样 panel 被 label 误盖的问题在视觉上不可能出现。
     if (overlay_) {
         overlay_->begin_frame();
         if (fps_widget_) {
             fps_widget_->tick();
             fps_widget_->render();
         }
+        if (grid_widget_) {
+            grid_widget_->tick();
+            grid_widget_->render();
+        }
+
+        // ---- 算法侧重算（事件驱动，使用本帧 panel rect）----
+        recompute_label_layout(swapchain_->extent());
+
+        if (label_widget_) {
+            // Travel times：固定 35 / 30 / 20 分钟（demo 模拟，不可调）
+            algo::TravelTimes fixed_times;
+            fixed_times.minutes_a = 35;
+            fixed_times.minutes_b = 30;
+            fixed_times.minutes_c = 20;
+            label_widget_->SetTravelTimes(fixed_times);
+            label_widget_->SetResults(grid_result_.labels);
+            label_widget_->tick();
+            label_widget_->render();
+        }
         overlay_->end_frame();
+    } else {
+        // 没有 overlay 的极端情形：仍要做一次算法重算
+        recompute_label_layout(swapchain_->extent());
     }
 
     // ---- Vulkan 帧驱动 ----

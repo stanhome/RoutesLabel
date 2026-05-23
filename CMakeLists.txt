@@ -136,8 +136,12 @@ add_executable(routes_label
     src/renderer/RouteScene.cpp
     src/renderer/RoutesRenderer.cpp
 
+    src/algo/GridCpu.cpp
+
     src/debug/DebugOverlay.cpp
     src/debug/FpsWidget.cpp
+    src/debug/GridDebugWidget.cpp
+    src/debug/LabelWidget.cpp
 
     src/utils/Log.cpp
     src/utils/FileSystem.cpp
