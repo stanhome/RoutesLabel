@@ -15,6 +15,7 @@
 
 #include "algo/GridCommon.h"
 #include "debug/IDebugWidget.h"
+#include "renderer/MapView.h"
 
 #include <array>
 #include <cstdint>
@@ -33,6 +34,8 @@ public:
     void SetRouteColors(const std::array<std::array<float, 3>, algo::kRouteCount>& colors) {
         colors_ = colors;
     }
+    // 每帧由 RoutesRenderer 注入：world(map-px) → logical/fb 的统一坐标变换。
+    void SetMapView(const renderer::MapView& mv) { map_view_ = mv; have_map_view_ = true; }
 
     void tick()   override {}    // 无内部状态，render() 直接消费最新 results_
     void render() override;
@@ -45,6 +48,8 @@ private:
         std::array<float, 3>{ 0.45f, 0.85f, 0.5f },  // B 绿
         std::array<float, 3>{ 0.45f, 0.65f, 1.0f },  // C 蓝
     };
+    renderer::MapView                                              map_view_{};
+    bool                                                           have_map_view_ = false;
 };
 
 }  // namespace routes_label::debug

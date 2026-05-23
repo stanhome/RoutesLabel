@@ -61,26 +61,31 @@ struct Polylines {
 
 struct GridParams {
     // ---- 屏幕与 grid ----
+    // screen_w/screen_h 语义 = **map-world 空间尺寸**（即 MapContext::mapViewRect 的 w/h），
+    // 与 framebuffer 像素 / window 像素**解耦**。窗口缩放只触发 view-projection 重算，
+    // 不会触发本算法重算（doc/map-world-space.md "screen_w/h semantics"）。
     float screen_w = 0.0f;
     float screen_h = 0.0f;
-    int   n_grid   = 40;           // 屏幕短边切几格（doc §2.2 默认 40）
+    int   n_grid   = 40;           // 短边切几格（doc §2.2 默认 40）
 
     // ---- label 几何（doc §3.3，加大版以呈现 app 风格 UI；LabelWidget 使用同一尺寸）----
-    // 注意：单位是 framebuffer 像素（与 polyline 屏幕坐标系一致）。
-    // 在 Retina 2× 屏上，400×100 fb-px ≈ 200×50 logical-px，正好是 app-card 的视觉尺寸。
+    // 单位 = map-world 像素（与 polyline / panel_rect / label anchor 一致）。
+    // 在屏上的视觉尺寸 = label_w/h × MapView::world_to_logical scale，随地图缩放。
     float label_w   = 400.0f;      // px
     float label_h   = 100.0f;      // px
     float leader_len = 36.0f;      // px
 
     // ---- 评分阈值（doc §2.7 / §2.8）----
-    float sep_threshold       = 0.5f;     // sep < 0.5 的 tile 视为未独占
+    float separationThreshold = 0.5f;     // separation < 0.5 的 tile 视为未独占
     float arclength_balance   = 0.2f;     // min/max 弧长比下限（防"无人区"）
     int   nms_grid_distance   = 2;        // 选中 tile 互相至少隔 1 格
     float anisotropy_min      = 4.0f;     // λ1/λ2 最小值（防各向同性 PCA）
 
     // ---- UI obstructing rect（doc/routes-select.md §1.1 MapContext.obstructingViews 概念）----
     // 调试面板等"压在地图上的浮窗"作为 label 摆放的硬约束；label AABB 不应与该 rect 相交。
-    // 单位：framebuffer 像素。空 rect（panel_w/h <= 0）表示无约束。
+    // 单位：**map-world 像素**（与 polyline 同坐标系）。由 RoutesRenderer 通过
+    // MapView::logical_to_world 把 ImGui 面板的 logical rect 转换后注入。
+    // 空 rect（panel_w/h <= 0）表示无约束。
     AABBf panel_rect{};   // 当前 mn=mx=0 表示空
 };
 
@@ -116,7 +121,7 @@ struct TilePca {
     Vec2f axis_v{};              // 次轴（单位向量，= rot90(u)）
     float lambda1 = 0.0f;
     float lambda2 = 0.0f;
-    float arclen[kRouteCount] = { 0.0f, 0.0f, 0.0f };   // 每路径在 tile 内的总弧长
+    float arclength[kRouteCount] = { 0.0f, 0.0f, 0.0f };   // 每路径在 tile 内的总弧长
     bool  valid   = false;       // false 表示退化（覆盖路径 < 3 / 各向同性）
 };
 
@@ -132,10 +137,10 @@ struct ProjInterval {
 // -----------------------------------------------------------------------------
 
 struct TileScore {
-    float sep        = 0.0f;
-    float density    = 0.0f;
-    float score      = 0.0f;
-    bool  feasible   = false;
+    float separationScore = 0.0f;
+    float density         = 0.0f;
+    float score           = 0.0f;
+    bool  feasible        = false;
     ProjInterval intervals[kRouteCount];
 };
 
@@ -170,9 +175,9 @@ struct GridDebugSnapshot {
     GridParams params{};
     int n_x = 0;
     int n_y = 0;
-    float tile_size = 0.0f;
+    float tile_size = 0.0f;            // 单位：**map-world 像素**（与 polyline 一致）
     std::vector<TileScore> tile_scores;   // size = n_x * n_y
-    std::vector<TilePca>   tile_pca;      // size = n_x * n_y
+    std::vector<TilePca>   tile_pca;      // size = n_x * n_y, mu / axis_u 单位 = world px
     std::array<int, kRouteCount> selected_tile_index = { -1, -1, -1 };  // 选中 tile 在 grid 中的 index（-1 = 无）
 };
 

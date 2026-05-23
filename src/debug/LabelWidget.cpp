@@ -2,7 +2,8 @@
 // debug/LabelWidget.cpp
 //
 // Map label 绘制：用 ImGui ImDrawList 在前景图层直接画 3 个有设计感的"app 风格" label：
-//   - 整体尺寸 220×64 px（framebuffer 像素），与 algo::GridParams 的 label_w/h 一致
+//   - 整体尺寸 400×100 px（**map-world px**，与 algo::GridParams 的 label_w/h 一致），
+//     通过 MapView::world_to_logical 上屏，随窗口缩放（doc/map-world-space.md）
 //   - 左侧彩色徽章（路径色 + 大字号 A/B/C），右侧白色信息卡（路径名 + 通行时间双行）
 //   - 圆角 + 阴影 + 白色细边，map pin 风格 anchor，路径色 leader line
 //
@@ -20,13 +21,14 @@ namespace routes_label::debug {
 
 namespace {
 
-// label 整体尺寸（framebuffer 像素，与 algo::GridParams 默认 label_w/label_h 严格一致；
+// label 整体尺寸（**map-world px**，与 algo::GridParams 默认 label_w/label_h 严格一致；
 // 算法侧 §3.2 的 grid-AABB 校验也用同样的尺寸做 C2 相交校验，必须保持同步）。
-// Retina 2× 屏：400×100 fb-px ≈ 200×50 logical-px，符合 navigation app 的卡片尺寸。
+// world px 单位 → 通过 MapView::world_to_logical_scale_uniform() 上屏，随窗口缩放
+// 自动缩放，与 ribbon、grid 视觉比例稳定（doc/map-world-space.md）。
 constexpr float kLabelW = 400.0f;
 constexpr float kLabelH = 100.0f;
 
-// 内部布局参数（framebuffer 像素）
+// 内部布局参数（map-world px）
 constexpr float kBadgeW       = 90.0f;   // 左侧彩色徽章宽度
 constexpr float kCornerRadius = 18.0f;   // label 整体圆角（更柔和）
 constexpr float kShadowExpand = 6.0f;    // 阴影向外扩展像素
@@ -58,21 +60,20 @@ std::array<float, 3> darken(const std::array<float, 3>& rgb, float amount = 0.65
 LabelWidget::LabelWidget() = default;
 
 void LabelWidget::render() {
-    ImGuiIO& io = ImGui::GetIO();
     ImDrawList* dl = ImGui::GetForegroundDrawList();
     if (!dl) return;
+    if (!have_map_view_) return;   // RoutesRenderer 必须每帧 SetMapView
 
-    // 算法侧 anchor / label_center 是 framebuffer 像素；ImGui 用 logical 像素。
-    const float fb_scale_x = (io.DisplayFramebufferScale.x > 0.0f) ? io.DisplayFramebufferScale.x : 1.0f;
-    const float fb_scale_y = (io.DisplayFramebufferScale.y > 0.0f) ? io.DisplayFramebufferScale.y : 1.0f;
-    const float to_logical_x = 1.0f / fb_scale_x;
-    const float to_logical_y = 1.0f / fb_scale_y;
-    // label 尺寸用屏幕短边的 scale，避免 x/y scale 不一致时 label 视觉变形
-    const float to_logical_uniform = 0.5f * (to_logical_x + to_logical_y);
-
-    auto fb_to_logical = [&](float fx, float fy) {
-        return ImVec2(fx * to_logical_x, fy * to_logical_y);
+    // 算法侧 anchor / label_center 是 **world (map) px**，与 polyline 同坐标系；
+    // 通过 MapView 的 world→logical 复合变换上屏（contain fit-to-window + fb→logical）。
+    // label 几何尺寸（kLabelW / kLabelH）也定义在 world px：随地图整体缩放，
+    // 视觉上与 ribbon、grid 保持比例稳定（doc/map-world-space.md "Decision: label 尺寸沿用 world px"）。
+    auto world_to_logical = [&](float wx, float wy) {
+        const glm::vec2 l = map_view_.world_to_logical({ wx, wy });
+        return ImVec2(l.x, l.y);
     };
+    // world → logical 的均匀 scale（用于把 label 几何长度上屏）
+    const float to_logical_uniform = map_view_.world_to_logical_scale_uniform();
 
     const int   travel[algo::kRouteCount]     = { travel_.minutes_a, travel_.minutes_b, travel_.minutes_c };
     const char  route_char[algo::kRouteCount] = { 'A', 'B', 'C' };
@@ -90,8 +91,8 @@ void LabelWidget::render() {
         const auto& r = results_[i];
         if (r.status == algo::LabelStatus::Infeasible) continue;
 
-        const ImVec2 anchor_l = fb_to_logical(r.anchor.x, r.anchor.y);
-        const ImVec2 center_l = fb_to_logical(r.label_center.x, r.label_center.y);
+        const ImVec2 anchor_l = world_to_logical(r.anchor.x, r.anchor.y);
+        const ImVec2 center_l = world_to_logical(r.label_center.x, r.label_center.y);
 
         const ImVec2 rect_min{ center_l.x - 0.5f * w_l, center_l.y - 0.5f * h_l };
         const ImVec2 rect_max{ center_l.x + 0.5f * w_l, center_l.y + 0.5f * h_l };

@@ -3,8 +3,8 @@
 // debug/GridDebugWidget.h
 // Routes-Select Grid 算法调试面板：
 //   - 显示算法计算时间（CPU 单线程 ms）
-//   - 编辑 grid 参数（n_grid / sep 阈值 / arclength_balance / nms_dist）
-//   - 开关：tile 热图叠加 / PCA 主轴可视化 / 选中 tile 高亮
+//   - 编辑 grid 参数（n_grid / separation 阈值 / arclength_balance / nms_dist）
+//   - 开关：PCA 主轴可视化 / 选中 tile 高亮
 //   - 把面板本帧的实际矩形（logical 像素）暴露给外部，供算法将其作为
 //     obstructing rect 加入 label 摆放硬约束（doc routes-select.md §1.1 MapContext.obstructingViews）
 //
@@ -13,6 +13,7 @@
 
 #include "algo/GridCommon.h"
 #include "debug/IDebugWidget.h"
+#include "renderer/MapView.h"
 
 #include <array>
 
@@ -25,10 +26,12 @@ public:
     // ---- inputs ----
     void SetSnapshot(const algo::GridDebugSnapshot& s) { snapshot_ = s; have_snapshot_ = true; }
     void SetComputeMs(float ms) { last_compute_ms_ = ms; }
+    // 每帧由 RoutesRenderer 注入：snapshot 中所有几何（tile_size / pca.mu / pca.axis_u）
+    // 单位为 **map-world px**，需通过 MapView 上屏。
+    void SetMapView(const renderer::MapView& mv) { map_view_ = mv; have_map_view_ = true; }
 
     // ---- outputs (调用方每帧读取) ----
     [[nodiscard]] algo::GridParams  params_overrides() const { return params_; }
-    [[nodiscard]] bool show_heatmap()    const { return show_heatmap_; }
     [[nodiscard]] bool show_pca_axis()   const { return show_pca_axis_; }
     [[nodiscard]] bool show_selected()   const { return show_selected_; }
     [[nodiscard]] bool dirty_and_clear()       { bool d = dirty_; dirty_ = false; return d; }
@@ -61,12 +64,13 @@ private:
     algo::GridDebugSnapshot  snapshot_{};
     bool params_inited_     = false;
     bool have_snapshot_     = false;
-    bool show_heatmap_      = false;
     bool show_pca_axis_     = false;
     bool show_selected_     = true;
     bool dirty_             = true;   // 初始化时标记 dirty 以触发首次计算
     float last_compute_ms_  = 0.0f;
     PanelRectLogical last_panel_rect_{};
+    renderer::MapView map_view_{};
+    bool have_map_view_ = false;
 };
 
 }  // namespace routes_label::debug

@@ -53,18 +53,21 @@ git submodule update --init --recursive
 cmake -S . -B build
 cmake --build build -j
 
-# Linux：直接跑
+# Linux：直接跑（系统包安装好 Vulkan 驱动/loader 即可）
 ./build/bin/routes_label
+# 也可以用 tools/run-linux.sh，支持 LunarG SDK 与 validation 开关
+./tools/run-linux.sh                       # 普通运行
+ROUTES_VALIDATION=1 ./tools/run-linux.sh   # 强制开启 validation layer
 
-# macOS：用 tools/run.sh，会自动设置 MoltenVK ICD / Validation Layer / dyld 搜索路径
-./tools/run.sh
+# macOS：用 tools/run-mac.sh，会自动设置 MoltenVK ICD / Validation Layer / dyld 搜索路径
+./tools/run-mac.sh
 ```
 
 可选：
 - 切换到 Release 构建：`cmake -S . -B build -DCMAKE_BUILD_TYPE=Release`
 - 强制开启 validation layer：`-DROUTES_ENABLE_VALIDATION=ON`
 
-> macOS 下不通过 `tools/run.sh` 直接运行时，需要手动设置以下环境变量让 Vulkan loader 找到 MoltenVK 与 validation layer：
+> macOS 下不通过 `tools/run-mac.sh` 直接运行时，需要手动设置以下环境变量让 Vulkan loader 找到 MoltenVK 与 validation layer：
 > ```
 > export VK_DRIVER_FILES=$(brew --prefix)/etc/vulkan/icd.d/MoltenVK_icd.json
 > export VK_LAYER_PATH=$(brew --prefix)/share/vulkan/explicit_layer.d
@@ -79,7 +82,8 @@ RoutesLabel/
 ├── cmake/
 │   └── CompileShaders.cmake  GLSL→SPIR-V 编译辅助函数
 ├── tools/
-│   └── run.sh                macOS 运行包装脚本（设置 Vulkan 环境变量）
+│   ├── run-mac.sh            macOS 运行包装脚本（MoltenVK ICD / Validation Layer / dyld 路径）
+│   └── run-linux.sh          Linux 运行包装脚本（LunarG SDK 集成 + validation 开关）
 ├── third_party/
 │   ├── glfw/                 GLFW（submodule）
 │   └── glm/                  GLM（submodule）

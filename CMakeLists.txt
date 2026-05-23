@@ -133,6 +133,7 @@ add_executable(routes_label
     src/rhi/Buffer.cpp
     src/rhi/Descriptor.cpp
 
+    src/renderer/MapView.cpp
     src/renderer/RouteScene.cpp
     src/renderer/RoutesRenderer.cpp
 

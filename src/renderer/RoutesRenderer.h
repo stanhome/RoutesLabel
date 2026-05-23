@@ -13,6 +13,7 @@
 
 #include "algo/GridCommon.h"
 #include "platform/Window.h"
+#include "renderer/MapView.h"
 #include "renderer/RouteScene.h"
 #include "rhi/Buffer.h"
 
@@ -75,11 +76,14 @@ private:
     void create_pipeline();
     void create_debug_overlay();
 
-    void update_ubo_for_frame(uint32_t frame_index, VkExtent2D extent);
+    void update_ubo_for_frame(uint32_t frame_index, VkExtent2D extent, const MapView& map_view);
     void record_command_buffer(VkCommandBuffer cmd, uint32_t image_index);
 
     // 在主线程更新 algo state（事件驱动：屏幕变化 / 参数变化时调用）。
-    void recompute_label_layout(VkExtent2D extent);
+    void recompute_label_layout(const MapView& map_view);
+
+    // 计算本帧的 MapView（contain fit-to-window）。
+    MapView compute_map_view(VkExtent2D extent) const;
 
     rhi::Instance&        instance_;
     rhi::PhysicalDevice&  physical_;
@@ -117,7 +121,16 @@ private:
     algo::GridResult                          grid_result_;
     std::unique_ptr<debug::LabelWidget>       label_widget_;
     std::unique_ptr<debug::GridDebugWidget>   grid_widget_;
-    VkExtent2D                                last_extent_       = { 0, 0 };
+    // 仅日志去重，不作为算法重算依据。算法 grid 在 map-world 空间切分（参见
+    // doc/map-world-space.md），窗口缩放仅触发 view-projection 重算，不触发 algo。
+    VkExtent2D                                last_logged_extent_ = { 0, 0 };
+
+    // 上次注入算法的 panel world-space AABB（mn.x, mn.y, mx.x, mx.y）。
+    // 关键：当窗口缩放但 panel 的 logical rect 不变时（如仅改变窗口高度），
+    // panel 在 world 空间的投影 AABB 仍会变 —— 此时必须重算 label 摆放，
+    // 否则 label 与 panel 在屏幕上会出现 overlap（issue 修复）。
+    bool                                      have_last_panel_world_ = false;
+    algo::AABBf                               last_panel_world_{};
 };
 
 }  // namespace routes_label::renderer

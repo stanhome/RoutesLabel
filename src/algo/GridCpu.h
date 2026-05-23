@@ -9,7 +9,7 @@
 // 流程：
 //   Stage A: 双 payload 同次 voxel traversal（线段 → tile-clipped sub_seg + 完整线段 AABB 入箱）
 //   Stage B: per-tile 加权 PCA（2x2 闭式特征分解）
-//   Stage C: sep / density / score
+//   Stage C: separation / density / score
 //   Stage D: Top-3 + NMS + label 摆放（grid-AABB 加速 8 slot 校验）
 //
 // 复杂度：O(N · √n_grid)，N=100 / 1080p 实测 < 1 ms（doc §9）。

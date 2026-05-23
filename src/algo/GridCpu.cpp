@@ -118,7 +118,7 @@ bool segment_intersects_aabb(const Vec2f& p0, const Vec2f& p1, const AABBf& bb) 
 struct Cell {
     std::vector<SubSeg>  subsegs;  // 三路径混合存储，用 SubSeg::route_id 区分
     std::vector<SegAABB> aabbs;    // 整线段 AABB
-    float arclen[kRouteCount] = { 0.0f, 0.0f, 0.0f };  // 每路径在该 tile 内的累计弧长
+    float arclength[kRouteCount] = { 0.0f, 0.0f, 0.0f };  // 每路径在该 tile 内的累计弧长
 };
 
 struct Grid {
@@ -198,7 +198,7 @@ void voxel_traverse_segment(const Vec2f& p0, const Vec2f& p1,
         ss.route_id  = route_id;
         const int id = g.idx(ix, iy);
         g.cells[id].subsegs.push_back(ss);
-        g.cells[id].arclen[route_id] += ss.arclength;
+        g.cells[id].arclength[route_id] += ss.arclength;
     };
 
     // 边界保护：起点/终点都在 grid 外的极端线段直接降级（demo 场景里几乎不会发生）
@@ -241,14 +241,14 @@ void voxel_traverse_segment(const Vec2f& p0, const Vec2f& p1,
 
 void compute_tile_pca(const Cell& cell, TilePca& out) {
     out = {};
-    out.arclen[0] = cell.arclen[0];
-    out.arclen[1] = cell.arclen[1];
-    out.arclen[2] = cell.arclen[2];
+    out.arclength[0] = cell.arclength[0];
+    out.arclength[1] = cell.arclength[1];
+    out.arclength[2] = cell.arclength[2];
 
     // 至少 3 路径都覆盖 tile（doc §2.4 退化处理：W_total < 3 个有效 sub_seg）
     int routes_with_data = 0;
     for (int i = 0; i < kRouteCount; ++i) {
-        if (cell.arclen[i] > 1e-3f) ++routes_with_data;
+        if (cell.arclength[i] > 1e-3f) ++routes_with_data;
     }
     if (routes_with_data < kRouteCount) return;
     if (cell.subsegs.empty())          return;
@@ -313,7 +313,7 @@ void compute_tile_pca(const Cell& cell, TilePca& out) {
 }
 
 // -----------------------------------------------------------------------------
-// Stage C: sep / density / score
+// Stage C: separation / density / score
 // -----------------------------------------------------------------------------
 
 void compute_tile_score(const Cell& cell,
@@ -365,26 +365,26 @@ void compute_tile_score(const Cell& cell,
         return std::max(0.0f, hi - lo);
     };
     const float ov = overlap(0, 1) + overlap(0, 2) + overlap(1, 2);
-    const float sep = std::clamp(1.0f - ov / total_len, 0.0f, 1.0f);
+    const float separation = std::clamp(1.0f - ov / total_len, 0.0f, 1.0f);
 
     // density：三路径在 tile 内的弧长总和 / tile 边长（doc §2.7）
-    const float total_arclen = pca.arclen[0] + pca.arclen[1] + pca.arclen[2];
-    const float density = std::clamp(total_arclen / std::max(params.label_w, 1.0f), 0.0f, 1.0f);
+    const float total_arclength = pca.arclength[0] + pca.arclength[1] + pca.arclength[2];
+    const float density = std::clamp(total_arclength / std::max(params.label_w, 1.0f), 0.0f, 1.0f);
 
     // arclength_balance（doc §2.7）：min/max < 0.2 视为"无人区"
-    float al_min = pca.arclen[0];
-    float al_max = pca.arclen[0];
+    float al_min = pca.arclength[0];
+    float al_max = pca.arclength[0];
     for (int i = 1; i < kRouteCount; ++i) {
-        al_min = std::min(al_min, pca.arclen[i]);
-        al_max = std::max(al_max, pca.arclen[i]);
+        al_min = std::min(al_min, pca.arclength[i]);
+        al_max = std::max(al_max, pca.arclength[i]);
     }
-    const bool arclen_ok = (al_max > 1e-3f)
+    const bool arclength_ok = (al_max > 1e-3f)
                        && (al_min / al_max >= params.arclength_balance);
 
-    out.sep      = sep;
-    out.density  = density;
-    out.score    = arclen_ok ? (sep * density) : 0.0f;
-    out.feasible = arclen_ok && (sep >= params.sep_threshold);
+    out.separationScore = separation;
+    out.density         = density;
+    out.score           = arclength_ok ? (separation * density) : 0.0f;
+    out.feasible        = arclength_ok && (separation >= params.separationThreshold);
 }
 
 // -----------------------------------------------------------------------------
@@ -451,7 +451,7 @@ std::array<float, kRouteCount> tile_per_route_score(const TileScore& ts,
         const float center_pen = std::abs(t_mid_i);
         r[i] = gap_total - 0.1f * center_pen;
         // 还要要求路径 i 在 tile 内有显著弧长（不然就是"被擦边的路径"）
-        if (pca.arclen[i] < 1.0f) r[i] = -1e9f;
+        if (pca.arclength[i] < 1.0f) r[i] = -1e9f;
     }
     return r;
 }
@@ -696,13 +696,13 @@ find_per_route_exclusive_tiles(const Grid& g) {
             const int id = g.idx(cx, cy);
             const Cell& cell = g.cells[id];
             for (int i = 0; i < kRouteCount; ++i) {
-                const float self_len = cell.arclen[i];
+                const float self_len = cell.arclength[i];
                 if (self_len <= kOtherEpsilon) continue;
 
                 bool exclusive = true;
                 for (int j = 0; j < kRouteCount; ++j) {
                     if (j == i) continue;
-                    if (cell.arclen[j] > kOtherEpsilon) { exclusive = false; break; }
+                    if (cell.arclength[j] > kOtherEpsilon) { exclusive = false; break; }
                 }
                 if (!exclusive) continue;
 
@@ -765,7 +765,7 @@ GridResult GridCpu::compute(const Polylines& polylines,
         compute_tile_pca(g.cells[t], tile_pcas[t]);
     }
 
-    // ---- Stage C：sep / density / score ----
+    // ---- Stage C：separation / density / score ----
     std::vector<TileScore> tile_scores(g.cells.size());
     for (size_t t = 0; t < g.cells.size(); ++t) {
         compute_tile_score(g.cells[t], tile_pcas[t], params, tile_scores[t]);
