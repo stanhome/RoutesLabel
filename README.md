@@ -257,6 +257,6 @@ RoutesLabel/
 
 ## 10. 引用
 
-如果本算法或实现对你的工作有帮助，欢迎引用本仓库；学术上请同时引用 [`doc/routes-select.md` §11](doc/routes-select.md) 与 [`doc/routes-select-grid-variance.md` §8](doc/routes-select-grid-variance.md) 中列出的 16 + 14 篇基础文献。
+如果本算法或实现对你的工作有帮助，欢迎引用本仓库
 
 > Issue / PR welcome —— 特别是 GPU 优化方向（scan-scatter / fp16 / indirect dispatch / 纯 GPU Top-K），以及在不同移动 GPU 上的 perf 数据贡献。
