@@ -39,6 +39,12 @@ public:
     void SetCpuComputeMs(float ms) { last_cpu_ms_ = ms; }
     void SetGpuComputeMs(float ms) { last_gpu_ms_ = ms; }
 
+    // GPU 端 timestamp 精测值（仅 GPU 路径有意义；< 0 表示 N/A）
+    //   - gpu_work_ms       = 5 个 dispatch 的纯 GPU 端执行时间（不含 fill / copy / submit / fence wait）
+    //   - gpu_round_trip_ms = cmd buffer 内 GPU 端总耗时（含 zero-init fill + 5 dispatch + staging copy）
+    void SetGpuWorkMs(float ms)      { last_gpu_work_ms_       = ms; }
+    void SetGpuRoundTripMs(float ms) { last_gpu_round_trip_ms_ = ms; }
+
     // GPU backend 是否可用（对应 GridGpu::is_available()）。
     // GPU 可用 → 自动切到 GPU 模式（让用户开机就看到 GPU 性能）；
     // GPU 不可用 → 强制 CPU 模式。
@@ -66,6 +72,9 @@ public:
     [[nodiscard]] bool show_selected()   const { return show_selected_; }
     [[nodiscard]] AlgoBackend backend()  const { return backend_; }
     [[nodiscard]] bool force_recompute() const { return force_recompute_; }
+    // 是否要求 GPU 路径回拉 PCA / TileScore 调试 staging（关闭可显著减少 readback 开销，
+    // 用于直观验证 readback 在 GPU 模式 round-trip 时间中的占比）。
+    [[nodiscard]] bool collect_gpu_debug() const { return collect_gpu_debug_; }
 
     // dirty 检测：force_recompute=true 时永远返回 true，让上层每帧都重算。
     [[nodiscard]] bool dirty_and_clear() {
@@ -114,8 +123,11 @@ private:
     AlgoBackend backend_         = AlgoBackend::Cpu;   // 默认 CPU；GPU 初始化成功后由上层切到 Gpu
     bool        gpu_available_   = false;
     bool        force_recompute_ = false;   // 默认事件驱动；用户可在面板勾选打开以观察 CPU/GPU 帧率差异
+    bool        collect_gpu_debug_ = true;  // GPU 路径是否回拉 PCA/TileScore staging（关闭后 PCA/Selected 可视化失效）
     float       last_cpu_ms_     = 0.0f;
     float       last_gpu_ms_     = 0.0f;
+    float       last_gpu_work_ms_       = -1.0f;   // < 0 = N/A
+    float       last_gpu_round_trip_ms_ = -1.0f;
     std::string gpu_status_text_ = "Initializing...";
 };
 

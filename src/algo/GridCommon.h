@@ -191,6 +191,14 @@ struct GridResult {
 
     // 时间戳（CPU 单线程实测 ms，便于 overlay 显示）
     float compute_ms = 0.0f;
+
+    // GPU timestamp 测量（仅 GPU 路径填充；CPU 路径或设备不支持 timestamp 时保持 -1）
+    //   - gpu_work_ms       = 5 个 dispatch 的纯 GPU 端执行时间（不含 fill / staging copy / submit / fence wait）
+    //   - gpu_round_trip_ms = cmd buffer 内 GPU 端总耗时（含 zero-init fill + 5 dispatch + staging copy）
+    // CPU 端 compute_ms 还会额外包含 host memcpy 上传 + vkQueueSubmit + vkWaitForFences + readback 解码，
+    // 三者形成完整剖分：compute_ms ≥ gpu_round_trip_ms ≥ gpu_work_ms。
+    float gpu_work_ms       = -1.0f;
+    float gpu_round_trip_ms = -1.0f;
 };
 
 // -----------------------------------------------------------------------------

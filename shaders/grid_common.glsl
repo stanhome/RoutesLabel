@@ -14,11 +14,12 @@
 
 // -----------------------------------------------------------------------------
 // 静态预算（必须与 src/algo/GridGpu.cpp 中的 kMax* 完全一致）
+// 2026-05 升级到 ~5K 顶点 demo，扩容 SUBSEGS/AABBS/POLY_VERTS。
 // -----------------------------------------------------------------------------
 #define MAX_TILES        8192
-#define MAX_SUBSEGS      8192
-#define MAX_AABBS        4096
-#define MAX_POLY_VERTS   8192
+#define MAX_SUBSEGS      32768
+#define MAX_AABBS        16384
+#define MAX_POLY_VERTS   16384
 #define ROUTE_COUNT      3
 
 // -----------------------------------------------------------------------------

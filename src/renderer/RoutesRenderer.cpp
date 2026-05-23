@@ -428,7 +428,8 @@ void RoutesRenderer::recompute_label_layout(const MapView& map_view) {
     const debug::AlgoBackend bk = grid_widget_->backend();
     bool used_gpu = false;
     if (bk == debug::AlgoBackend::Gpu && grid_gpu_ && grid_gpu_->is_available()) {
-        algo::GridResult r = grid_gpu_->compute(polys, params, /*collect_debug=*/true);
+        const bool collect_debug = grid_widget_->collect_gpu_debug();
+        algo::GridResult r = grid_gpu_->compute(polys, params, collect_debug);
         // 任何 label PoolOverflow → 视为 GPU 失效，自动降级
         bool overflow = false;
         for (int i = 0; i < algo::kRouteCount; ++i) {
@@ -442,6 +443,8 @@ void RoutesRenderer::recompute_label_layout(const MapView& map_view) {
             last_gpu_result_ = r;
             grid_result_     = r;
             grid_widget_->SetGpuComputeMs(r.compute_ms);
+            grid_widget_->SetGpuWorkMs(r.gpu_work_ms);
+            grid_widget_->SetGpuRoundTripMs(r.gpu_round_trip_ms);
             used_gpu = true;
         }
     }

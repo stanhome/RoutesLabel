@@ -57,6 +57,17 @@ void GridDebugWidget::render() {
         } else {
             ImGui::TextDisabled("CPU compute: %.3f ms", last_cpu_ms_);
             ImGui::Text("GPU compute: %.3f ms  (active)", last_gpu_ms_);
+            // GPU 端 timestamp 精测（缩进显示作为 "GPU compute" 行的子项）
+            if (last_gpu_work_ms_ >= 0.0f) {
+                ImGui::Text("  GPU work:    %.3f ms", last_gpu_work_ms_);
+            } else {
+                ImGui::TextDisabled("  GPU work:    N/A");
+            }
+            if (last_gpu_round_trip_ms_ >= 0.0f) {
+                ImGui::Text("  Round-trip:  %.3f ms", last_gpu_round_trip_ms_);
+            } else {
+                ImGui::TextDisabled("  Round-trip:  N/A");
+            }
         }
         // GPU 状态行
         if (gpu_available_) {
@@ -81,6 +92,13 @@ void GridDebugWidget::render() {
         ImGui::TextDisabled("Visualization");
         ImGui::Checkbox("PCA principal axis", &show_pca_axis_);
         ImGui::Checkbox("Selected tile",     &show_selected_);
+        // GPU 路径专属：是否回拉 PCA / TileScore staging（仅 GPU 模式下生效；
+        // 关闭后 PCA / Selected 可视化会失效是预期行为，用于直观验证 readback 占比）。
+        if (backend_ == AlgoBackend::Gpu) {
+            const bool prev_collect = collect_gpu_debug_;
+            ImGui::Checkbox("Collect GPU debug data", &collect_gpu_debug_);
+            if (collect_gpu_debug_ != prev_collect) dirty_ = true;
+        }
 
         if (have_snapshot_) {
             ImGui::Separator();

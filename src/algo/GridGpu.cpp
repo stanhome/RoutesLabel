@@ -35,12 +35,13 @@ namespace {
 // -----------------------------------------------------------------------------
 // n_grid 滑块上限 80 → 1080×1080 / (13.5²) ≈ 6400 tile，留 25% 余量取 8192。
 constexpr uint32_t kMaxTiles    = 8192;
-// 三路径 polyline，N=100~500，每段被 voxel traverse 切 1~10 个 sub_seg → ≤ 5000；翻倍取 8192。
-constexpr uint32_t kMaxSubsegs  = 8192;
-// 线段 AABB 入箱：每段平均 1~4 tile，取 4096 上限。
-constexpr uint32_t kMaxAabbs    = 4096;
-// 单一路径 polyline 顶点数上限（×3 路径）。
-constexpr uint32_t kMaxPolyVerts = 8192;
+// 三路径 polyline，扩容到 ~5K 顶点 demo（每条 ~1700 点） + 额外余量。
+// 每段 voxel-traverse 平均切 1~3 个 sub_seg → 5K×~3 = 15K 上限，2× 余量取 32768。
+constexpr uint32_t kMaxSubsegs  = 32768;
+// 线段 AABB 入箱：5K 段、平均 1~2 tile，~10K，余量取 16384。
+constexpr uint32_t kMaxAabbs    = 16384;
+// 单一 polyline 顶点数上限（×3 路径），扩到 16384 容纳 ~5K 顶点 demo + 余量。
+constexpr uint32_t kMaxPolyVerts = 16384;
 
 // -----------------------------------------------------------------------------
 // std430 SSBO 布局（与 5 个 .comp shader 中的 struct 字面相同）
@@ -148,6 +149,15 @@ struct GridGpu::Impl {
     VkCommandBuffer cmd_buf  = VK_NULL_HANDLE;
     VkFence         fence    = VK_NULL_HANDLE;
 
+    // GPU timestamp（doc / plan grid-perf-A-B：分两段精测 GPU work vs Round-trip）
+    //   slot 0 = host->GPU memory barrier 之后、fill 之前   → round-trip 起点
+    //   slot 1 = 第一个 dispatch (pipe_scan) 之前           → GPU work 起点
+    //   slot 2 = 最后一个 dispatch (pipe_label) 之后        → GPU work 终点
+    //   slot 3 = host-readable barrier 之后、cmd_buf 末尾   → round-trip 终点
+    VkQueryPool query_pool          = VK_NULL_HANDLE;
+    bool        timestamps_supported = false;
+    double      ts_period_ns        = 0.0;   // physical.properties.limits.timestampPeriod
+
     Impl(rhi::Device& d, rhi::PhysicalDevice& p) : device(d), physical(p) {}
     ~Impl() { destroy_vk_objects(); }
 
@@ -156,6 +166,7 @@ struct GridGpu::Impl {
 
     void destroy_vk_objects() noexcept {
         VkDevice dev = device.handle();
+        if (query_pool != VK_NULL_HANDLE) { vkDestroyQueryPool(dev, query_pool, nullptr); query_pool = VK_NULL_HANDLE; }
         if (fence    != VK_NULL_HANDLE) { vkDestroyFence(dev, fence, nullptr);            fence    = VK_NULL_HANDLE; }
         if (cmd_pool != VK_NULL_HANDLE) { vkDestroyCommandPool(dev, cmd_pool, nullptr);   cmd_pool = VK_NULL_HANDLE; cmd_buf = VK_NULL_HANDLE; }
         // pipeline / desc / buffer 由 unique_ptr / Buffer RAII 自动释放（顺序无关）
@@ -168,6 +179,7 @@ struct GridGpu::Impl {
             update_descriptor_set();
             create_pipelines();
             create_cmd_pool_and_fence();
+            create_query_pool();   // 能力探测 + 创建 4-slot timestamp query pool（失败不致命）
             available = true;
             LOG_INFO("[GridGpu] initialized successfully (compute pipeline ready)");
             return true;
@@ -321,6 +333,45 @@ struct GridGpu::Impl {
         VkFenceCreateInfo fci = {};
         fci.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
         VK_CHECK(vkCreateFence(device.handle(), &fci, nullptr, &fence));
+    }
+
+    // 创建 4-slot timestamp query pool（不致命：失败时 timestamps_supported=false，
+    // compute() 会跳过写读，把 GridResult.gpu_*_ms 留 -1 表示 N/A）。
+    void create_query_pool() noexcept {
+        timestamps_supported = false;
+        ts_period_ns         = static_cast<double>(physical.properties().limits.timestampPeriod);
+        if (ts_period_ns <= 0.0) {
+            LOG_WARN("[GridGpu] timestampPeriod=0 → GPU timestamp disabled");
+            return;
+        }
+
+        // 查 graphics_family 的 timestampValidBits：必须 >0 才能在该 queue 上写 timestamp
+        uint32_t qfam_count = 0;
+        vkGetPhysicalDeviceQueueFamilyProperties(physical.handle(), &qfam_count, nullptr);
+        if (qfam_count == 0) {
+            LOG_WARN("[GridGpu] no queue families → GPU timestamp disabled");
+            return;
+        }
+        std::vector<VkQueueFamilyProperties> qprops(qfam_count);
+        vkGetPhysicalDeviceQueueFamilyProperties(physical.handle(), &qfam_count, qprops.data());
+        const uint32_t gfx = device.graphics_family();
+        if (gfx >= qfam_count || qprops[gfx].timestampValidBits == 0) {
+            LOG_WARN("[GridGpu] graphics queue family timestampValidBits=0 → GPU timestamp disabled");
+            return;
+        }
+
+        VkQueryPoolCreateInfo qpci = {};
+        qpci.sType      = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;
+        qpci.queryType  = VK_QUERY_TYPE_TIMESTAMP;
+        qpci.queryCount = 4;   // slot 0..3
+        VkResult vr = vkCreateQueryPool(device.handle(), &qpci, nullptr, &query_pool);
+        if (vr != VK_SUCCESS || query_pool == VK_NULL_HANDLE) {
+            LOG_WARN("[GridGpu] vkCreateQueryPool failed (" << vr << ") → GPU timestamp disabled");
+            query_pool = VK_NULL_HANDLE;
+            return;
+        }
+        timestamps_supported = true;
+        LOG_INFO("[GridGpu] timestamp query pool ready (period=" << ts_period_ns << " ns/tick)");
     }
 };
 
@@ -482,6 +533,11 @@ GridResult GridGpu::compute(const Polylines& polylines,
     bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     VK_CHECK(vkBeginCommandBuffer(I.cmd_buf, &bi));
 
+    // GPU timestamp（必须在录制状态下 reset；首次/复用都安全）
+    if (I.timestamps_supported) {
+        vkCmdResetQueryPool(I.cmd_buf, I.query_pool, 0, 4);
+    }
+
     // host-visible writes（polylines_buf / segment_offsets_buf / params_ubo）→ shader read
     // 显式 barrier 让 GPU 看到 host 端 memcpy 的内容。
     {
@@ -493,6 +549,11 @@ GridResult GridGpu::compute(const Polylines& polylines,
             VK_PIPELINE_STAGE_HOST_BIT,
             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
             0, 1, &mb, 0, nullptr, 0, nullptr);
+    }
+
+    // [Timestamp slot 0] round-trip 起点（host->GPU barrier 之后、fill 之前）
+    if (I.timestamps_supported) {
+        vkCmdWriteTimestamp(I.cmd_buf, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, I.query_pool, 0);
     }
 
     // 显式 zero-init 关键计数 buffer：避免依赖 grid_scan 的清零（race-free 路径）
@@ -537,6 +598,10 @@ GridResult GridGpu::compute(const Polylines& polylines,
     };
 
     // ---- Stage 0: scan/zero-init ----
+    // [Timestamp slot 1] GPU work 起点（fill+barrier 之后、第一个 dispatch 之前）
+    if (I.timestamps_supported) {
+        vkCmdWriteTimestamp(I.cmd_buf, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, I.query_pool, 1);
+    }
     bind_pipe(*I.pipe_scan);
     vkCmdDispatch(I.cmd_buf, ceil_div(kMaxTiles, 64), 1, 1);
     barrier_compute();
@@ -563,6 +628,11 @@ GridResult GridGpu::compute(const Polylines& polylines,
     vkCmdDispatch(I.cmd_buf, 1, 1, 1);
     barrier_compute();
 
+    // [Timestamp slot 2] GPU work 终点（最后一个 dispatch + barrier 完成后、staging copy 之前）
+    if (I.timestamps_supported) {
+        vkCmdWriteTimestamp(I.cmd_buf, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, I.query_pool, 2);
+    }
+
     // ---- Copy SSBO → host-visible staging ----
     auto copy = [&](rhi::Buffer& src, rhi::Buffer& dst, VkDeviceSize size) {
         VkBufferCopy bc = {};
@@ -588,6 +658,11 @@ GridResult GridGpu::compute(const Polylines& polylines,
             0, 1, &mb, 0, nullptr, 0, nullptr);
     }
 
+    // [Timestamp slot 3] round-trip 终点（host-readable barrier 之后、cmd_buf 末尾）
+    if (I.timestamps_supported) {
+        vkCmdWriteTimestamp(I.cmd_buf, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, I.query_pool, 3);
+    }
+
     VK_CHECK(vkEndCommandBuffer(I.cmd_buf));
 
     // -------------------------------------------------------------------------
@@ -610,6 +685,35 @@ GridResult GridGpu::compute(const Polylines& polylines,
             out.labels[r].status   = LabelStatus::Infeasible;
         }
         return out;
+    }
+
+    // -------------------------------------------------------------------------
+    // 3.1 读取 GPU timestamp（fence 已 wait，无需 WAIT_BIT）
+    //   slot 0 → round-trip 起点；slot 3 → round-trip 终点
+    //   slot 1 → GPU work 起点；   slot 2 → GPU work 终点
+    // 不支持 timestamp 时保持 -1（GridResult 默认值）。
+    // -------------------------------------------------------------------------
+    if (I.timestamps_supported) {
+        uint64_t ticks[4] = { 0, 0, 0, 0 };
+        VkResult qr = vkGetQueryPoolResults(
+            dev, I.query_pool, 0, 4,
+            sizeof(ticks), ticks, sizeof(uint64_t),
+            VK_QUERY_RESULT_64_BIT);
+        if (qr == VK_SUCCESS) {
+            // 防御：tick 应单调递增；个别驱动若返回乱序则按 0 处理
+            const uint64_t t0 = ticks[0];
+            const uint64_t t1 = ticks[1];
+            const uint64_t t2 = ticks[2];
+            const uint64_t t3 = ticks[3];
+            const double work_ns       = (t2 > t1) ? static_cast<double>(t2 - t1) * I.ts_period_ns : 0.0;
+            const double round_trip_ns = (t3 > t0) ? static_cast<double>(t3 - t0) * I.ts_period_ns : 0.0;
+            out.gpu_work_ms       = static_cast<float>(work_ns       * 1e-6);
+            out.gpu_round_trip_ms = static_cast<float>(round_trip_ns * 1e-6);
+        } else {
+            // VK_NOT_READY 之类异常一律降级为 N/A，不阻塞主流程
+            out.gpu_work_ms       = -1.0f;
+            out.gpu_round_trip_ms = -1.0f;
+        }
     }
 
     // -------------------------------------------------------------------------
@@ -750,7 +854,9 @@ GridResult GridGpu::compute(const Polylines& polylines,
              << ", subseg=" << status[1] << ", aabb=" << status[2]
              << ", overflow=" << status[0]
              << ", placed=" << placed << ", infeasible=" << infeasible
-             << ", time=" << out.compute_ms << " ms");
+             << ", time=" << out.compute_ms << " ms"
+             << ", gpu_work=" << out.gpu_work_ms << " ms"
+             << ", gpu_rt=" << out.gpu_round_trip_ms << " ms");
 
     return out;
 }
