@@ -1,0 +1,159 @@
+#version 450
+//
+// shaders/grid_pca.comp
+// Stage B: per-tile 加权 PCA + 2x2 闭式特征分解
+//
+// Dispatch: (n_tile, 1, 1)，每 workgroup 处理 1 个 tile。
+// Workgroup size = 32。32 线程协同扫描全局 sub_seg pool，filter tile_id == workgroupId.x，
+// 每线程累加 (w, wx, wy, wxx, wyy, wxy, arclen[3])，存到 shared 数组；
+// 线程 0 串行 reduction 后做闭式特征分解，写 tile_pca[tile_id]。
+//
+// 数学：单 pass 累加，最后用 Σw(c-μ)² = Σw·c² − μ·Σw·c 一次性求加权协方差。
+//
+// 对应文档：doc/routes-select-grid-gpu.md §4.2
+// 对应 CPU：src/algo/GridCpu.cpp::compute_tile_pca
+//
+#extension GL_GOOGLE_include_directive : require
+
+#include "grid_common.glsl"
+
+layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
+
+// 每线程一个槽位，线程 0 串行 reduce
+shared float s_w  [32];
+shared float s_wx [32];
+shared float s_wy [32];
+shared float s_wxx[32];
+shared float s_wyy[32];
+shared float s_wxy[32];
+shared float s_al0[32];
+shared float s_al1[32];
+shared float s_al2[32];
+
+void main() {
+    uint tile_id = gl_WorkGroupID.x;
+    int  lane    = int(gl_LocalInvocationIndex);
+    if (int(tile_id) >= P.n_x * P.n_y) return;
+
+    // 1. 局部累加
+    float l_w   = 0.0;
+    float l_wx  = 0.0;
+    float l_wy  = 0.0;
+    float l_wxx = 0.0;
+    float l_wyy = 0.0;
+    float l_wxy = 0.0;
+    float l_al0 = 0.0;
+    float l_al1 = 0.0;
+    float l_al2 = 0.0;
+
+    uint subseg_total = status_flags.data[1];
+    if (subseg_total > uint(MAX_SUBSEGS)) subseg_total = uint(MAX_SUBSEGS);
+
+    for (uint i = uint(lane); i < subseg_total; i += 32u) {
+        SubSeg ss = subseg_pool.data[i];
+        if (ss.tile_id != tile_id) continue;
+        float w = ss.arclength;
+        if (w <= 0.0) continue;
+        float cx = 0.5 * (ss.start.x + ss.end.x);
+        float cy = 0.5 * (ss.start.y + ss.end.y);
+        l_w   += w;
+        l_wx  += w * cx;
+        l_wy  += w * cy;
+        l_wxx += w * cx * cx;
+        l_wyy += w * cy * cy;
+        l_wxy += w * cx * cy;
+        if (ss.route_id == 0u) l_al0 += w;
+        else if (ss.route_id == 1u) l_al1 += w;
+        else if (ss.route_id == 2u) l_al2 += w;
+    }
+
+    s_w  [lane] = l_w;
+    s_wx [lane] = l_wx;
+    s_wy [lane] = l_wy;
+    s_wxx[lane] = l_wxx;
+    s_wyy[lane] = l_wyy;
+    s_wxy[lane] = l_wxy;
+    s_al0[lane] = l_al0;
+    s_al1[lane] = l_al1;
+    s_al2[lane] = l_al2;
+    barrier();
+
+    if (lane != 0) return;
+
+    // 2. 线程 0 串行 reduce
+    float w   = 0.0;
+    float wx  = 0.0;
+    float wy  = 0.0;
+    float wxx = 0.0;
+    float wyy = 0.0;
+    float wxy = 0.0;
+    float al0 = 0.0;
+    float al1 = 0.0;
+    float al2 = 0.0;
+    for (int k = 0; k < 32; ++k) {
+        w   += s_w  [k];
+        wx  += s_wx [k];
+        wy  += s_wy [k];
+        wxx += s_wxx[k];
+        wyy += s_wyy[k];
+        wxy += s_wxy[k];
+        al0 += s_al0[k];
+        al1 += s_al1[k];
+        al2 += s_al2[k];
+    }
+
+    // 3. 写 tile_pca arclength（永远写）
+    tile_pca.data[tile_id].arclength0 = al0;
+    tile_pca.data[tile_id].arclength1 = al1;
+    tile_pca.data[tile_id].arclength2 = al2;
+
+    // 4. 退化检查（与 CPU compute_tile_pca 同步：3 路径都覆盖）
+    int routes_with_data = 0;
+    if (al0 > 1e-3) routes_with_data++;
+    if (al1 > 1e-3) routes_with_data++;
+    if (al2 > 1e-3) routes_with_data++;
+    if (routes_with_data < ROUTE_COUNT) {
+        tile_pca.data[tile_id].valid = 0u;
+        return;
+    }
+    if (w < 1e-3) {
+        tile_pca.data[tile_id].valid = 0u;
+        return;
+    }
+
+    // 5. 加权重心 + 加权协方差（用代数恒等式 Σw(c-μ)² = Σwc² - μ·Σwc）
+    float mu_x = wx / w;
+    float mu_y = wy / w;
+
+    // a = E[(x-μ)²] = wxx/w − μ_x²
+    // b = E[(x-μ)(y-μ)] = wxy/w − μ_x·μ_y
+    // c = E[(y-μ)²] = wyy/w − μ_y²
+    float a = wxx / w - mu_x * mu_x;
+    float b = wxy / w - mu_x * mu_y;
+    float c = wyy / w - mu_y * mu_y;
+
+    // 6. 闭式特征分解
+    float tr   = a + c;
+    float det  = a * c - b * b;
+    float disc = sqrt(max(0.25 * tr * tr - det, 0.0));
+    float l1   = 0.5 * tr + disc;
+    float l2   = 0.5 * tr - disc;
+
+    vec2 u;
+    if (abs(b) > 1e-9) {
+        float ux = b;
+        float uy = l1 - a;
+        float ul = sqrt(ux * ux + uy * uy);
+        u = vec2(ux / ul, uy / ul);
+    } else {
+        u = (a >= c) ? vec2(1.0, 0.0) : vec2(0.0, 1.0);
+    }
+    vec2 v = vec2(-u.y, u.x);
+
+    tile_pca.data[tile_id].mu      = vec2(mu_x, mu_y);
+    tile_pca.data[tile_id].axis_u  = u;
+    tile_pca.data[tile_id].axis_v  = v;
+    tile_pca.data[tile_id].lambda1 = l1;
+    tile_pca.data[tile_id].lambda2 = l2;
+    tile_pca.data[tile_id].valid   = 1u;
+}

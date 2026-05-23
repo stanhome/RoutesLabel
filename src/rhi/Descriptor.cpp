@@ -91,4 +91,26 @@ void DescriptorSets::update_uniform_buffer(uint32_t set_index,
     vkUpdateDescriptorSets(device_.handle(), 1, &w, 0, nullptr);
 }
 
+void DescriptorSets::update_storage_buffer(uint32_t set_index,
+                                           uint32_t binding,
+                                           VkBuffer buffer,
+                                           VkDeviceSize offset,
+                                           VkDeviceSize range) const {
+    VkDescriptorBufferInfo bi = {};
+    bi.buffer = buffer;
+    bi.offset = offset;
+    bi.range  = range;
+
+    VkWriteDescriptorSet w = {};
+    w.sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    w.dstSet          = sets_[set_index];
+    w.dstBinding      = binding;
+    w.dstArrayElement = 0;
+    w.descriptorType  = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    w.descriptorCount = 1;
+    w.pBufferInfo     = &bi;
+
+    vkUpdateDescriptorSets(device_.handle(), 1, &w, 0, nullptr);
+}
+
 }  // namespace routes_label::rhi

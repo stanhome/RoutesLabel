@@ -29,7 +29,44 @@ void GridDebugWidget::render() {
 
     PanelRectLogical pr{};
     if (ImGui::Begin("Routes Grid Algorithm", nullptr, kFlags)) {
-        ImGui::Text("Compute time: %.3f ms (CPU)", last_compute_ms_);
+        // ---- Backend 切换（CPU / GPU）----
+        ImGui::TextDisabled("Algorithm backend");
+        int backend_int = static_cast<int>(backend_);
+        bool prev_force = force_recompute_;
+        if (!gpu_available_) ImGui::BeginDisabled();
+        if (ImGui::RadioButton("CPU", &backend_int, 0)) {
+            backend_ = AlgoBackend::Cpu;
+            dirty_   = true;
+        }
+        ImGui::SameLine();
+        if (ImGui::RadioButton("GPU", &backend_int, 1)) {
+            backend_ = AlgoBackend::Gpu;
+            dirty_   = true;
+        }
+        if (!gpu_available_) ImGui::EndDisabled();
+
+        ImGui::Checkbox("Force recompute every frame", &force_recompute_);
+        if (force_recompute_ != prev_force) dirty_ = true;
+
+        ImGui::Separator();
+
+        // ---- 双 compute_ms 显示 ----
+        if (backend_ == AlgoBackend::Cpu) {
+            ImGui::Text("CPU compute: %.3f ms  (active)", last_cpu_ms_);
+            ImGui::TextDisabled("GPU compute: %.3f ms", last_gpu_ms_);
+        } else {
+            ImGui::TextDisabled("CPU compute: %.3f ms", last_cpu_ms_);
+            ImGui::Text("GPU compute: %.3f ms  (active)", last_gpu_ms_);
+        }
+        // GPU 状态行
+        if (gpu_available_) {
+            ImGui::TextDisabled("GPU: available");
+        } else {
+            ImGui::TextColored(ImVec4(1.0f, 0.6f, 0.3f, 1.0f),
+                "GPU: %s", gpu_status_text_.c_str());
+        }
+
+        ImGui::Separator();
         ImGui::Text("Grid: %d x %d  tile=%.1f px",
                     snapshot_.n_x, snapshot_.n_y, snapshot_.tile_size);
 

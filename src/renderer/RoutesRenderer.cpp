@@ -1,6 +1,7 @@
 #include "renderer/RoutesRenderer.h"
 
 #include "algo/GridCpu.h"
+#include "algo/GridGpu.h"
 #include "debug/DebugOverlay.h"
 #include "debug/FpsWidget.h"
 #include "debug/GridDebugWidget.h"
@@ -83,6 +84,7 @@ RoutesRenderer::~RoutesRenderer() {
     label_widget_.reset();
     fps_widget_.reset();
     overlay_.reset();
+    grid_gpu_.reset();
     grid_cpu_.reset();
     scene_.reset();
 
@@ -279,10 +281,28 @@ void RoutesRenderer::create_debug_overlay() {
         swapchain_->image_count());
     fps_widget_ = std::make_unique<debug::FpsWidget>();
 
-    // Routes-Select Grid 算法（CPU 阶段 1，doc/routes-select-grid-gpu.md §7）
+    // Routes-Select Grid 算法（doc/routes-select-grid-gpu.md）
+    // - GridCpu：ground truth + 低端机 fallback，永远存在
+    // - GridGpu：4-stage compute pipeline，运行期由 GridDebugWidget 切换
     grid_cpu_     = std::make_unique<algo::GridCpu>();
+#if defined(ROUTES_LABEL_USE_GPU) && ROUTES_LABEL_USE_GPU
+    grid_gpu_     = std::make_unique<algo::GridGpu>(device_, physical_);
+#endif
     label_widget_ = std::make_unique<debug::LabelWidget>();
     grid_widget_  = std::make_unique<debug::GridDebugWidget>();
+
+    // 把 GPU 可用状态注入 widget；如果 GPU 初始化失败 widget 会强制 CPU 模式
+    const bool gpu_ok = (grid_gpu_ != nullptr) && grid_gpu_->is_available();
+    grid_widget_->SetGpuAvailable(gpu_ok);
+    if (gpu_ok) {
+        grid_widget_->SetGpuStatusText("available");
+    } else if (grid_gpu_ == nullptr) {
+        grid_widget_->SetGpuStatusText("disabled at build time");
+    } else {
+        grid_widget_->SetGpuStatusText(grid_gpu_->last_error().empty()
+            ? std::string("unavailable")
+            : grid_gpu_->last_error());
+    }
 
     // 把场景配色传给 label widget
     if (scene_) {
@@ -402,10 +422,38 @@ void RoutesRenderer::recompute_label_layout(const MapView& map_view) {
     params.panel_rect = panel_world_valid ? panel_world : algo::AABBf{};
 
     const algo::Polylines polys = scene_->to_algo_polylines();
-    grid_result_ = grid_cpu_->compute(polys, params, /*collect_debug=*/true);
+
+    // 按 widget.backend() 派发：CPU 路径永远可用；GPU 路径在不可用 / 失败时
+    // 自动 fallback CPU 并 ForceCpuMode 防止 UI 继续选 GPU。
+    const debug::AlgoBackend bk = grid_widget_->backend();
+    bool used_gpu = false;
+    if (bk == debug::AlgoBackend::Gpu && grid_gpu_ && grid_gpu_->is_available()) {
+        algo::GridResult r = grid_gpu_->compute(polys, params, /*collect_debug=*/true);
+        // 任何 label PoolOverflow → 视为 GPU 失效，自动降级
+        bool overflow = false;
+        for (int i = 0; i < algo::kRouteCount; ++i) {
+            if (r.labels[i].status == algo::LabelStatus::PoolOverflow) { overflow = true; break; }
+        }
+        if (overflow) {
+            LOG_WARN("[RoutesRenderer] GPU pool overflow, falling back to CPU");
+            grid_widget_->SetGpuStatusText("pool overflow, fallback CPU");
+            grid_widget_->ForceCpuMode();
+        } else {
+            last_gpu_result_ = r;
+            grid_result_     = r;
+            grid_widget_->SetGpuComputeMs(r.compute_ms);
+            used_gpu = true;
+        }
+    }
+
+    if (!used_gpu) {
+        algo::GridResult r = grid_cpu_->compute(polys, params, /*collect_debug=*/true);
+        last_cpu_result_ = r;
+        grid_result_     = r;
+        grid_widget_->SetCpuComputeMs(r.compute_ms);
+    }
 
     grid_widget_->SetSnapshot(grid_result_.debug);
-    grid_widget_->SetComputeMs(grid_result_.compute_ms);
 
     // 4. 记录本次 panel world AABB 作为下次对比基准
     last_panel_world_      = panel_world;

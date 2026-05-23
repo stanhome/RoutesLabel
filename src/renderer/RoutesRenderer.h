@@ -39,6 +39,7 @@ class DescriptorSets;
 
 namespace routes_label::algo {
 class GridCpu;
+class GridGpu;
 }  // namespace routes_label::algo
 
 namespace routes_label::debug {
@@ -115,10 +116,15 @@ private:
     std::unique_ptr<debug::DebugOverlay>      overlay_;
     std::unique_ptr<debug::FpsWidget>         fps_widget_;
 
-    // Routes-Select Grid 算法状态（doc/routes-select-grid-gpu.md 阶段 1：CPU 实现）
+    // Routes-Select Grid 算法状态（doc/routes-select-grid-gpu.md）
+    // CPU 实现作为 ground truth + 低端机 fallback，GPU 实现作为高性能路径，运行期由
+    // GridDebugWidget 的 backend toggle 切换。
     std::unique_ptr<algo::GridCpu>            grid_cpu_;
+    std::unique_ptr<algo::GridGpu>            grid_gpu_;
     std::unique_ptr<RouteScene>               scene_;            // 持有原始 polyline，用于事件驱动重算
-    algo::GridResult                          grid_result_;
+    algo::GridResult                          grid_result_;      // 当前展示用结果（来自 active backend）
+    algo::GridResult                          last_cpu_result_;  // 用于 backend 切换时即时回放
+    algo::GridResult                          last_gpu_result_;
     std::unique_ptr<debug::LabelWidget>       label_widget_;
     std::unique_ptr<debug::GridDebugWidget>   grid_widget_;
     // 仅日志去重，不作为算法重算依据。算法 grid 在 map-world 空间切分（参见

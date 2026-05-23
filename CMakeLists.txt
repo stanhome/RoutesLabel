@@ -29,6 +29,13 @@ if(CMAKE_BUILD_TYPE STREQUAL "Debug")
 endif()
 message(STATUS "[RoutesLabel] Validation layers: ${ROUTES_ENABLE_VALIDATION}")
 
+# Compute shader pipeline 总开关（doc/routes-select-grid-gpu.md §7.1）
+# ON  → 编译并链接 GridGpu + 5 个 .comp shader（默认）
+# OFF → 仍然编译 GridGpu 源码（保持单一 build target），但运行期 widget 不会切到 GPU
+#       —— 通过 ROUTES_LABEL_USE_GPU compile definition 给运行期开关一个提示。
+option(ROUTES_LABEL_USE_GPU "Enable Vulkan compute shader pipeline for label placement" ON)
+message(STATUS "[RoutesLabel] GPU label pipeline: ${ROUTES_LABEL_USE_GPU}")
+
 # -----------------------------------------------------------------------------
 # 依赖
 # -----------------------------------------------------------------------------
@@ -128,6 +135,7 @@ add_executable(routes_label
     src/rhi/Framebuffer.cpp
     src/rhi/ShaderModule.cpp
     src/rhi/GraphicsPipeline.cpp
+    src/rhi/ComputePipeline.cpp
     src/rhi/CommandPool.cpp
     src/rhi/FrameSync.cpp
     src/rhi/Buffer.cpp
@@ -138,6 +146,7 @@ add_executable(routes_label
     src/renderer/RoutesRenderer.cpp
 
     src/algo/GridCpu.cpp
+    src/algo/GridGpu.cpp
 
     src/debug/DebugOverlay.cpp
     src/debug/FpsWidget.cpp
@@ -169,6 +178,7 @@ target_compile_options(routes_label PRIVATE
 
 target_compile_definitions(routes_label PRIVATE
     $<$<BOOL:${ROUTES_ENABLE_VALIDATION}>:ROUTES_ENABLE_VALIDATION=1>
+    $<$<BOOL:${ROUTES_LABEL_USE_GPU}>:ROUTES_LABEL_USE_GPU=1>
 )
 
 # -----------------------------------------------------------------------------
@@ -178,6 +188,11 @@ routes_compile_shaders(routes_label
     SHADERS
         ${CMAKE_CURRENT_SOURCE_DIR}/shaders/routes.vert
         ${CMAKE_CURRENT_SOURCE_DIR}/shaders/routes.frag
+        ${CMAKE_CURRENT_SOURCE_DIR}/shaders/grid_clip.comp
+        ${CMAKE_CURRENT_SOURCE_DIR}/shaders/grid_scan.comp
+        ${CMAKE_CURRENT_SOURCE_DIR}/shaders/grid_pca.comp
+        ${CMAKE_CURRENT_SOURCE_DIR}/shaders/grid_score.comp
+        ${CMAKE_CURRENT_SOURCE_DIR}/shaders/grid_label.comp
     OUTPUT_DIR
         ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/shaders
 )

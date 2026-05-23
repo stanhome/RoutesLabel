@@ -1,0 +1,192 @@
+#version 450
+//
+// shaders/grid_clip.comp
+// Stage A: Amanatides-Woo voxel traversal + 双 payload 入箱
+//
+// 输入：polylines[*]、segment_offsets[6]、Params（n_x/n_y/tile_size/...）
+// 输出：subseg_count[t*3+r]++ + subseg_pool[base+slot] = SubSeg
+//       aabb_count[t]++         + aabb_pool[base+slot] = SegAABB
+//
+// Dispatch：(ceil(N_seg_total / 64), 1, 1)，每线程处理一条 polyline 段。
+// gid 全局线程号 → (route_id, local_seg_id)，越界则 return。
+//
+// 对应文档：doc/routes-select-grid-gpu.md §2.1 + §4.1
+// 对应 CPU：src/algo/GridCpu.cpp::voxel_traverse_segment
+//
+// 工程坑：
+//   1. atomicAdd append 模式：返回值 ≥ MAX_xx 时设 status_flags[0]=1（pool overflow），
+//      但仍然不写出（防 OOB）。
+//   2. tile-local sub_seg：start/end 为 tile 边界裁剪后坐标。CPU 实现里用 t∈[0,1]
+//      插值。GPU 端做相同事情。
+//   3. AABB 入箱：写到 AABB **覆盖** 的 tile（cx_lo..cx_hi × cy_lo..cy_hi），
+//      与 voxel traversal 的 sub_seg 入箱**互补**（不一定同一组 tile）。
+//
+#extension GL_GOOGLE_include_directive : require
+
+#include "grid_common.glsl"
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+void emit_subseg(int cx, int cy, int route_id,
+                 vec2 start, vec2 end, float arclength) {
+    if (!tile_inside(cx, cy)) return;
+    if (arclength <= 0.0) return;
+    int t = tile_index(cx, cy);
+    // 每 tile 每路径计数（用于 stage C 弧长聚合 / debug）
+    atomicAdd(subseg_count.data[uint(t) * uint(ROUTE_COUNT) + uint(route_id)], 1u);
+
+    // 全局 pool 槽位：status_flags[1] 用作全局 subseg 计数器
+    uint global_slot = atomicAdd(status_flags.data[1], 1u);
+    if (global_slot >= MAX_SUBSEGS) {
+        // overflow：标志 + 不写出
+        status_flags.data[0] = 1u;
+        return;
+    }
+    SubSeg ss;
+    ss.start     = start;
+    ss.end       = end;
+    ss.arclength = arclength;
+    ss.route_id  = uint(route_id);
+    ss.tile_id   = uint(t);
+    ss._pad0     = 0u;
+    subseg_pool.data[global_slot] = ss;
+}
+
+void emit_aabb(int cx, int cy, int route_id, uint global_seg_id,
+               vec2 mn, vec2 mx) {
+    if (!tile_inside(cx, cy)) return;
+    int t = tile_index(cx, cy);
+    atomicAdd(aabb_count.data[uint(t)], 1u);
+
+    uint global_slot = atomicAdd(status_flags.data[2], 1u);
+    if (global_slot >= MAX_AABBS) {
+        status_flags.data[0] = 1u;
+        return;
+    }
+    SegAABB sa;
+    sa.mn            = mn;
+    sa.mx            = mx;
+    sa.route_id      = uint(route_id);
+    sa.global_seg_id = global_seg_id;
+    sa.tile_id       = uint(t);
+    sa._pad0         = 0u;
+    aabb_pool.data[global_slot] = sa;
+}
+
+// gid 在三路径合并的 segment 序号空间内。返回 (route_id, local_seg_id, vert_off)。
+// 若 gid 越界（无效线程），route_id = -1。
+void resolve_segment(uint gid, out int route_id, out uint vert_a, out uint vert_b) {
+    route_id = -1;
+    vert_a   = 0u;
+    vert_b   = 0u;
+
+    uint cumulative = 0u;
+    for (int r = 0; r < ROUTE_COUNT; ++r) {
+        uint off = seg_offsets.data[uint(r)];
+        uint len = seg_offsets.data[uint(ROUTE_COUNT) + uint(r)];
+        if (len < 2u) continue;
+        uint segs_r = len - 1u;
+        if (gid < cumulative + segs_r) {
+            uint local = gid - cumulative;
+            route_id = r;
+            vert_a   = off + local;
+            vert_b   = vert_a + 1u;
+            return;
+        }
+        cumulative += segs_r;
+    }
+}
+
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+
+    int  route_id;
+    uint vert_a;
+    uint vert_b;
+    resolve_segment(gid, route_id, vert_a, vert_b);
+    if (route_id < 0) return;
+
+    vec2 p0 = read_polyvert(vert_a);
+    vec2 p1 = read_polyvert(vert_b);
+    vec2 d  = p1 - p0;
+    float seg_len = length(d);
+    if (seg_len < 1e-6) return;
+
+    float s = P.tile_size;
+
+    // ---- 1. AABB 入箱（覆盖式，与 sub_seg 入箱互补）----
+    vec2 mn = min(p0, p1);
+    vec2 mx = max(p0, p1);
+    int cx_lo = int(floor(mn.x / s));
+    int cx_hi = int(floor(mx.x / s));
+    int cy_lo = int(floor(mn.y / s));
+    int cy_hi = int(floor(mx.y / s));
+    for (int cy = cy_lo; cy <= cy_hi; ++cy) {
+        for (int cx = cx_lo; cx <= cx_hi; ++cx) {
+            emit_aabb(cx, cy, route_id, gid, mn, mx);
+        }
+    }
+
+    // ---- 2. Amanatides-Woo voxel traversal ----
+    int cx     = int(floor(p0.x / s));
+    int cy     = int(floor(p0.y / s));
+    int cx_end = int(floor(p1.x / s));
+    int cy_end = int(floor(p1.y / s));
+
+    int step_x = 0;
+    int step_y = 0;
+    if (d.x > 0.0) step_x =  1;
+    else if (d.x < 0.0) step_x = -1;
+    if (d.y > 0.0) step_y =  1;
+    else if (d.y < 0.0) step_y = -1;
+
+    const float kHuge = 1e30;
+
+    float inv_dx = (abs(d.x) > 1e-12) ? 1.0 / d.x : 0.0;
+    float inv_dy = (abs(d.y) > 1e-12) ? 1.0 / d.y : 0.0;
+
+    float t_max_x = kHuge;
+    float t_max_y = kHuge;
+    if (step_x != 0) {
+        float bx = (step_x > 0) ? float(cx + 1) * s : float(cx) * s;
+        t_max_x = (bx - p0.x) * inv_dx;
+    }
+    if (step_y != 0) {
+        float by = (step_y > 0) ? float(cy + 1) * s : float(cy) * s;
+        t_max_y = (by - p0.y) * inv_dy;
+    }
+    float t_delta_x = (step_x != 0) ? s * abs(inv_dx) : kHuge;
+    float t_delta_y = (step_y != 0) ? s * abs(inv_dy) : kHuge;
+
+    float t_prev = 0.0;
+    const int kMaxSteps = 4096;
+    for (int step = 0; step < kMaxSteps; ++step) {
+        bool at_end = (cx == cx_end && cy == cy_end);
+        float t_next = min(min(1.0, t_max_x), t_max_y);
+
+        // emit subseg for current cell
+        vec2 ss_start = p0 + d * t_prev;
+        vec2 ss_end   = p0 + d * t_next;
+        float ss_len  = (t_next - t_prev) * seg_len;
+        emit_subseg(cx, cy, route_id, ss_start, ss_end, ss_len);
+
+        if (at_end || t_next >= 1.0) break;
+
+        if (t_max_x < t_max_y) {
+            cx     += step_x;
+            t_prev  = t_max_x;
+            t_max_x = t_max_x + t_delta_x;
+        } else if (t_max_y < t_max_x) {
+            cy     += step_y;
+            t_prev  = t_max_y;
+            t_max_y = t_max_y + t_delta_y;
+        } else {
+            // 角点：x、y 同时跨越
+            cx     += step_x;
+            cy     += step_y;
+            t_prev  = t_max_x;
+            t_max_x = t_max_x + t_delta_x;
+            t_max_y = t_max_y + t_delta_y;
+        }
+    }
+}

@@ -71,6 +71,14 @@ public:
                                VkDeviceSize offset,
                                VkDeviceSize range) const;
 
+    // SSBO 版本（compute shader 用）。语义同 update_uniform_buffer，但 descriptor type
+    // 为 VK_DESCRIPTOR_TYPE_STORAGE_BUFFER。
+    void update_storage_buffer(uint32_t set_index,
+                               uint32_t binding,
+                               VkBuffer buffer,
+                               VkDeviceSize offset,
+                               VkDeviceSize range) const;
+
 private:
     const Device&                device_;
     std::vector<VkDescriptorSet> sets_;

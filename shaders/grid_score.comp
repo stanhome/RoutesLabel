@@ -1,0 +1,166 @@
+#version 450
+//
+// shaders/grid_score.comp
+// Stage C: separation / density / score（per-tile）
+//
+// Dispatch: (n_tile, 1, 1)，每 workgroup 处理 1 个 tile，size = 32。
+// 32 线程协同扫描全局 sub_seg pool，filter tile_id == workgroupId.x，
+// 计算每路径在 PCA axis_u 上的 1D 投影区间 (t_min, t_max)；
+// 线程 0 串行 reduce 后算 overlap → separation → score → feasible。
+//
+// 对应文档：doc/routes-select-grid-gpu.md §4.3
+// 对应 CPU：src/algo/GridCpu.cpp::compute_tile_score
+//
+#extension GL_GOOGLE_include_directive : require
+
+#include "grid_common.glsl"
+
+layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
+
+const float kPosInf =  1e30;
+const float kNegInf = -1e30;
+
+shared float s_tmin[32 * ROUTE_COUNT];
+shared float s_tmax[32 * ROUTE_COUNT];
+
+void main() {
+    uint tile_id = gl_WorkGroupID.x;
+    int  lane    = int(gl_LocalInvocationIndex);
+    if (int(tile_id) >= P.n_x * P.n_y) return;
+
+    // 1. 早退：PCA 不 valid
+    if (tile_pca.data[tile_id].valid == 0u) {
+        if (lane == 0) {
+            tile_score.data[tile_id].separation = 0.0;
+            tile_score.data[tile_id].density    = 0.0;
+            tile_score.data[tile_id].score      = 0.0;
+            tile_score.data[tile_id].feasible   = 0u;
+            tile_score.data[tile_id].iv0.valid  = 0u;
+            tile_score.data[tile_id].iv1.valid  = 0u;
+            tile_score.data[tile_id].iv2.valid  = 0u;
+        }
+        return;
+    }
+    // 各向异性退化
+    float l1 = tile_pca.data[tile_id].lambda1;
+    float l2 = tile_pca.data[tile_id].lambda2;
+    if (l2 > 1e-6 && l1 / l2 < P.anisotropy_min) {
+        if (lane == 0) {
+            tile_score.data[tile_id].separation = 0.0;
+            tile_score.data[tile_id].density    = 0.0;
+            tile_score.data[tile_id].score      = 0.0;
+            tile_score.data[tile_id].feasible   = 0u;
+            tile_score.data[tile_id].iv0.valid  = 0u;
+            tile_score.data[tile_id].iv1.valid  = 0u;
+            tile_score.data[tile_id].iv2.valid  = 0u;
+        }
+        return;
+    }
+
+    vec2 mu     = tile_pca.data[tile_id].mu;
+    vec2 axis_u = tile_pca.data[tile_id].axis_u;
+
+    // 2. 每线程局部 t_min/t_max
+    vec3 ltmin = vec3(kPosInf, kPosInf, kPosInf);
+    vec3 ltmax = vec3(kNegInf, kNegInf, kNegInf);
+
+    uint subseg_total = status_flags.data[1];
+    if (subseg_total > uint(MAX_SUBSEGS)) subseg_total = uint(MAX_SUBSEGS);
+
+    for (uint i = uint(lane); i < subseg_total; i += 32u) {
+        SubSeg ss = subseg_pool.data[i];
+        if (ss.tile_id != tile_id) continue;
+        // 投影两端点
+        float t_a = (ss.start.x - mu.x) * axis_u.x + (ss.start.y - mu.y) * axis_u.y;
+        float t_b = (ss.end.x   - mu.x) * axis_u.x + (ss.end.y   - mu.y) * axis_u.y;
+        if (ss.route_id == 0u) {
+            ltmin.x = min(ltmin.x, min(t_a, t_b));
+            ltmax.x = max(ltmax.x, max(t_a, t_b));
+        } else if (ss.route_id == 1u) {
+            ltmin.y = min(ltmin.y, min(t_a, t_b));
+            ltmax.y = max(ltmax.y, max(t_a, t_b));
+        } else {
+            ltmin.z = min(ltmin.z, min(t_a, t_b));
+            ltmax.z = max(ltmax.z, max(t_a, t_b));
+        }
+    }
+
+    s_tmin[lane * ROUTE_COUNT + 0] = ltmin.x;
+    s_tmin[lane * ROUTE_COUNT + 1] = ltmin.y;
+    s_tmin[lane * ROUTE_COUNT + 2] = ltmin.z;
+    s_tmax[lane * ROUTE_COUNT + 0] = ltmax.x;
+    s_tmax[lane * ROUTE_COUNT + 1] = ltmax.y;
+    s_tmax[lane * ROUTE_COUNT + 2] = ltmax.z;
+    barrier();
+
+    if (lane != 0) return;
+
+    // 3. 线程 0 reduce
+    vec3 tmin = vec3(kPosInf, kPosInf, kPosInf);
+    vec3 tmax = vec3(kNegInf, kNegInf, kNegInf);
+    for (int k = 0; k < 32; ++k) {
+        tmin.x = min(tmin.x, s_tmin[k * ROUTE_COUNT + 0]);
+        tmin.y = min(tmin.y, s_tmin[k * ROUTE_COUNT + 1]);
+        tmin.z = min(tmin.z, s_tmin[k * ROUTE_COUNT + 2]);
+        tmax.x = max(tmax.x, s_tmax[k * ROUTE_COUNT + 0]);
+        tmax.y = max(tmax.y, s_tmax[k * ROUTE_COUNT + 1]);
+        tmax.z = max(tmax.z, s_tmax[k * ROUTE_COUNT + 2]);
+    }
+
+    // 4. 三路径都需要有有效区间
+    if (tmin.x > tmax.x || tmin.y > tmax.y || tmin.z > tmax.z) {
+        tile_score.data[tile_id].separation = 0.0;
+        tile_score.data[tile_id].density    = 0.0;
+        tile_score.data[tile_id].score      = 0.0;
+        tile_score.data[tile_id].feasible   = 0u;
+        tile_score.data[tile_id].iv0.valid  = 0u;
+        tile_score.data[tile_id].iv1.valid  = 0u;
+        tile_score.data[tile_id].iv2.valid  = 0u;
+        return;
+    }
+
+    vec3 len  = tmax - tmin;
+    float total_len = len.x + len.y + len.z;
+    if (total_len < 1e-3) {
+        tile_score.data[tile_id].score    = 0.0;
+        tile_score.data[tile_id].feasible = 0u;
+        return;
+    }
+
+    // overlap 两两
+    float ov01 = max(0.0, min(tmax.x, tmax.y) - max(tmin.x, tmin.y));
+    float ov02 = max(0.0, min(tmax.x, tmax.z) - max(tmin.x, tmin.z));
+    float ov12 = max(0.0, min(tmax.y, tmax.z) - max(tmin.y, tmin.z));
+    float ov   = ov01 + ov02 + ov12;
+    float separation = clamp(1.0 - ov / total_len, 0.0, 1.0);
+
+    // density
+    float al0 = tile_pca.data[tile_id].arclength0;
+    float al1 = tile_pca.data[tile_id].arclength1;
+    float al2 = tile_pca.data[tile_id].arclength2;
+    float total_arclen = al0 + al1 + al2;
+    float density = clamp(total_arclen / max(P.label_w, 1.0), 0.0, 1.0);
+
+    // arclength balance
+    float al_min = min(al0, min(al1, al2));
+    float al_max = max(al0, max(al1, al2));
+    bool arclen_ok = (al_max > 1e-3) && (al_min / al_max >= P.arclength_balance);
+
+    float score = arclen_ok ? (separation * density) : 0.0;
+    bool feasible = arclen_ok && (separation >= P.separationThreshold);
+
+    // 写出
+    tile_score.data[tile_id].separation = separation;
+    tile_score.data[tile_id].density    = density;
+    tile_score.data[tile_id].score      = score;
+    tile_score.data[tile_id].feasible   = feasible ? 1u : 0u;
+    tile_score.data[tile_id].iv0.t_min  = tmin.x;
+    tile_score.data[tile_id].iv0.t_max  = tmax.x;
+    tile_score.data[tile_id].iv0.valid  = 1u;
+    tile_score.data[tile_id].iv1.t_min  = tmin.y;
+    tile_score.data[tile_id].iv1.t_max  = tmax.y;
+    tile_score.data[tile_id].iv1.valid  = 1u;
+    tile_score.data[tile_id].iv2.t_min  = tmin.z;
+    tile_score.data[tile_id].iv2.t_max  = tmax.z;
+    tile_score.data[tile_id].iv2.valid  = 1u;
+}

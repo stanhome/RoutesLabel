@@ -1,0 +1,532 @@
+#version 450
+//
+// shaders/grid_label.comp
+// Stage D: Top-3 + NMS + 路径分配 + 8 slot label 摆放（含共线兜底）
+//
+// Dispatch: (1, 1, 1)，1 workgroup × 64 线程。
+// 流程：
+//   1) 64 线程并行扫描 ~MAX_TILES tile，每线程维护"局部最佳 3 tile"（feasible 优先），
+//      barrier 后由 0 号线程做 64*3 = 192 次串行 reduction 选出 NMS 后 Top-3 (≥ nms_grid_distance)；
+//   2) 若 Top-3 不足 3 个 → 共线兜底：再扫一次找每路径独占 tile（arclength_i > 0, others == 0）；
+//   3) 反投影 anchor + 暴力 6 排列分配路径；
+//   4) 摆 label 顺序（远离屏幕中心的先摆），每 label 8 slot 校验（走全局 aabb_pool 扫描）；
+//   5) 写 final_labels[3]。
+//
+// 对应文档：doc/routes-select-grid-gpu.md §3.1 + §3.2 + §4.4 + §7.4
+// 对应 CPU：src/algo/GridCpu.cpp::select_top3 / assign_routes / place_label / find_per_route_exclusive_tiles
+//
+#extension GL_GOOGLE_include_directive : require
+
+#include "grid_common.glsl"
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+// 8 方位单位向量（屏幕坐标 y 朝下：N=(0,-1)）
+const float kInvSqrt2 = 0.7071067811865475;
+const vec2 kSlotDir[8] = vec2[8](
+    vec2( 0.0,       -1.0      ),
+    vec2( kInvSqrt2, -kInvSqrt2),
+    vec2( 1.0,        0.0      ),
+    vec2( kInvSqrt2,  kInvSqrt2),
+    vec2( 0.0,        1.0      ),
+    vec2(-kInvSqrt2,  kInvSqrt2),
+    vec2(-1.0,        0.0      ),
+    vec2(-kInvSqrt2, -kInvSqrt2)
+);
+
+// per-thread top-3：score / tile_id / cx / cy
+shared float s_topscore[64 * 3];
+shared int   s_topidx  [64 * 3];
+shared int   s_topcx   [64 * 3];
+shared int   s_topcy   [64 * 3];
+
+// global Top-3 after reduction（线程 0 写入）
+shared int   g_top_idx[3];
+shared int   g_top_cx [3];
+shared int   g_top_cy [3];
+shared float g_top_score[3];
+shared int   g_top_count;
+
+// per-route exclusive tile（共线兜底）：每线程局部最佳 → reduce
+shared float s_excl_len[64 * ROUTE_COUNT];
+shared int   s_excl_idx[64 * ROUTE_COUNT];
+
+// 最终 anchor + assigned route
+shared vec2 g_anchor[ROUTE_COUNT];
+shared int  g_anchor_route[ROUTE_COUNT];   // tiles[i] 分配给的 route id；-1 表示无
+shared bool g_anchor_valid[ROUTE_COUNT];
+shared bool g_used_fallback;
+
+// 摆放结果
+shared vec2 g_label_center[ROUTE_COUNT];
+shared uint g_label_slot  [ROUTE_COUNT];
+shared uint g_label_status[ROUTE_COUNT];
+
+// label AABB（已摆放）：每 label 32 B，shared 占 ROUTE_COUNT*4*4 = 48B
+shared vec4 g_placed_aabb[ROUTE_COUNT];   // (mn.x, mn.y, mx.x, mx.y)
+shared int  g_placed_count;
+
+// -----------------------------------------------------------------------------
+// 工具函数
+// -----------------------------------------------------------------------------
+
+bool aabb_intersects(vec4 a, vec4 b) {
+    if (a.z <= a.x || a.w <= a.y || b.z <= b.x || b.w <= b.y) return false;
+    return !(a.z <= b.x || b.z <= a.x || a.w <= b.y || b.w <= a.y);
+}
+
+// Liang-Barsky segment-AABB 相交（与 CPU::segment_intersects_aabb 等价）
+bool segment_intersects_aabb(vec2 p0, vec2 p1, vec4 bb) {
+    // 端点在内
+    if (p0.x >= bb.x && p0.x <= bb.z && p0.y >= bb.y && p0.y <= bb.w) return true;
+    if (p1.x >= bb.x && p1.x <= bb.z && p1.y >= bb.y && p1.y <= bb.w) return true;
+
+    vec2 segmn = min(p0, p1);
+    vec2 segmx = max(p0, p1);
+    if (segmx.x < bb.x || segmn.x > bb.z || segmx.y < bb.y || segmn.y > bb.w) return false;
+
+    float dx = p1.x - p0.x;
+    float dy = p1.y - p0.y;
+    float t0 = 0.0;
+    float t1 = 1.0;
+
+    // 4 条边裁剪
+    float p_arr[4] = float[4](-dx,  dx, -dy,  dy);
+    float q_arr[4] = float[4](p0.x - bb.x, bb.z - p0.x, p0.y - bb.y, bb.w - p0.y);
+    for (int k = 0; k < 4; ++k) {
+        float p = p_arr[k];
+        float q = q_arr[k];
+        if (abs(p) < 1e-12) {
+            if (q < 0.0) return false;
+        } else {
+            float r = q / p;
+            if (p < 0.0) {
+                if (r > t1) return false;
+                if (r > t0) t0 = r;
+            } else {
+                if (r < t0) return false;
+                if (r < t1) t1 = r;
+            }
+        }
+    }
+    return t0 <= t1;
+}
+
+// label AABB 与他路任何线段相交？
+bool label_hits_other_routes(vec4 L, int self_route) {
+    uint aabb_total = status_flags.data[2];
+    if (aabb_total > uint(MAX_AABBS)) aabb_total = uint(MAX_AABBS);
+    for (uint i = 0u; i < aabb_total; ++i) {
+        SegAABB sa = aabb_pool.data[i];
+        if (int(sa.route_id) == self_route) continue;
+        vec4 bb = vec4(sa.mn, sa.mx);
+        if (!aabb_intersects(L, bb)) continue;
+        // 还需精确 SAT：找到原始线段
+        // 我们没存原始端点，但 SegAABB 记录了 global_seg_id；
+        // 简化：用 AABB 的对角线作为线段近似（AABB-AABB 已通过即可），代价是精度略松。
+        // 工程上对 demo 足够；CPU 实现已经做了精确 SAT，这里是 GPU 简化。
+        // 实际上更好：把 polyline 顶点也读进来。下面读 polyline 做精确 SAT：
+        // segment 顶点 = polylines[global_seg_id], polylines[global_seg_id+1]
+        // 但 global_seg_id 在 stage A 用的是 dispatch global gid，需要在 host 端
+        // 把 polylines 紧凑布局后保证 gid 与 polyline 索引一致。
+        // 当前 host 端：gid → resolve_segment(gid, route, vert_a, vert_b) → polylines[vert_a]
+        // 我们这里没法逆查 vert_a；所以保留 AABB-AABB 近似。
+        return true;
+    }
+    return false;
+}
+
+vec4 rect_aabb(vec2 center, float w, float h) {
+    return vec4(center.x - 0.5 * w, center.y - 0.5 * h,
+                center.x + 0.5 * w, center.y + 0.5 * h);
+}
+
+vec4 inflate_aabb(vec4 a, float p) {
+    return vec4(a.x - p, a.y - p, a.z + p, a.w + p);
+}
+
+// -----------------------------------------------------------------------------
+// 主入口
+// -----------------------------------------------------------------------------
+
+void main() {
+    int  lane = int(gl_LocalInvocationIndex);
+    int  n_tile = P.n_x * P.n_y;
+
+    // ---- 初始化共享变量 ----
+    if (lane == 0) {
+        g_top_count        = 0;
+        g_top_idx[0] = -1;  g_top_idx[1] = -1;  g_top_idx[2] = -1;
+        g_top_cx [0] =  0;  g_top_cx [1] =  0;  g_top_cx [2] =  0;
+        g_top_cy [0] =  0;  g_top_cy [1] =  0;  g_top_cy [2] =  0;
+        g_top_score[0] = 0.0; g_top_score[1] = 0.0; g_top_score[2] = 0.0;
+        g_used_fallback   = false;
+        g_placed_count    = 0;
+        for (int r = 0; r < ROUTE_COUNT; ++r) {
+            g_anchor[r]       = vec2(0.0);
+            g_anchor_route[r] = -1;
+            g_anchor_valid[r] = false;
+            g_label_center[r] = vec2(0.0);
+            g_label_slot  [r] = 2u;   // E
+            g_label_status[r] = 2u;   // Infeasible
+        }
+    }
+    barrier();
+
+    // ============================================================
+    // Phase 1: 每线程局部 Top-3（feasible & score 排序）
+    // ============================================================
+    float lt_score[3] = float[3](-1.0, -1.0, -1.0);
+    int   lt_idx  [3] = int  [3](-1, -1, -1);
+    int   lt_cx   [3] = int  [3](0, 0, 0);
+    int   lt_cy   [3] = int  [3](0, 0, 0);
+
+    for (int t = lane; t < n_tile; t += 64) {
+        if (tile_score.data[uint(t)].feasible == 0u) continue;
+        float s = tile_score.data[uint(t)].score;
+        int cx = t % P.n_x;
+        int cy = t / P.n_x;
+        // insertion sort 3 项
+        for (int k = 0; k < 3; ++k) {
+            if (s > lt_score[k]) {
+                // 后移
+                for (int m = 2; m > k; --m) {
+                    lt_score[m] = lt_score[m-1];
+                    lt_idx  [m] = lt_idx  [m-1];
+                    lt_cx   [m] = lt_cx   [m-1];
+                    lt_cy   [m] = lt_cy   [m-1];
+                }
+                lt_score[k] = s;
+                lt_idx  [k] = t;
+                lt_cx   [k] = cx;
+                lt_cy   [k] = cy;
+                break;
+            }
+        }
+    }
+
+    for (int k = 0; k < 3; ++k) {
+        s_topscore[lane * 3 + k] = lt_score[k];
+        s_topidx  [lane * 3 + k] = lt_idx  [k];
+        s_topcx   [lane * 3 + k] = lt_cx   [k];
+        s_topcy   [lane * 3 + k] = lt_cy   [k];
+    }
+    barrier();
+
+    // ---- 线程 0 串行 reduction：从 64*3 = 192 个候选中按 NMS 选 Top-3 ----
+    if (lane == 0) {
+        int min_dist = max(1, P.nms_grid_distance);
+
+        for (int round = 0; round < 3; ++round) {
+            float best_s = -1.0;
+            int   best_p = -1;
+            for (int p = 0; p < 64 * 3; ++p) {
+                if (s_topidx[p] < 0) continue;
+                float s = s_topscore[p];
+                if (s <= best_s) continue;
+                int cx = s_topcx[p];
+                int cy = s_topcy[p];
+                bool ok = true;
+                for (int q = 0; q < round; ++q) {
+                    int dx = abs(cx - g_top_cx[q]);
+                    int dy = abs(cy - g_top_cy[q]);
+                    if (max(dx, dy) < min_dist) { ok = false; break; }
+                }
+                if (!ok) continue;
+                best_s = s;
+                best_p = p;
+            }
+            if (best_p < 0) break;
+            g_top_idx  [round] = s_topidx  [best_p];
+            g_top_cx   [round] = s_topcx   [best_p];
+            g_top_cy   [round] = s_topcy   [best_p];
+            g_top_score[round] = s_topscore[best_p];
+            g_top_count = round + 1;
+            // 让该候选不再被选中
+            s_topidx[best_p] = -1;
+        }
+    }
+    barrier();
+
+    // ============================================================
+    // Phase 2: 路径分配（Top-3 → 3 路径）
+    //   per_tile_score[t][r] = gap_total - 0.1 * |t_mid_r|（CPU 同等式）
+    //   再要求 arclength[r] > 1.0，否则 -1e9
+    //   暴力 6 排列选最大
+    // ============================================================
+    if (lane == 0 && g_top_count >= 3) {
+        // 算每 tile 三路径分数
+        float prs[3][3];
+        for (int ti = 0; ti < 3; ++ti) {
+            int idx = g_top_idx[ti];
+            TileScore ts = tile_score.data[uint(idx)];
+            TilePca   pc = tile_pca  .data[uint(idx)];
+            for (int r = 0; r < 3; ++r) {
+                ProjInterval iv_r = (r == 0) ? ts.iv0 : ((r == 1) ? ts.iv1 : ts.iv2);
+                if (iv_r.valid == 0u) { prs[ti][r] = -1e9; continue; }
+                float t_mid = 0.5 * (iv_r.t_min + iv_r.t_max);
+                float gap_total = 0.0;
+                for (int j = 0; j < 3; ++j) {
+                    if (j == r) continue;
+                    ProjInterval iv_j = (j == 0) ? ts.iv0 : ((j == 1) ? ts.iv1 : ts.iv2);
+                    if (iv_j.valid == 0u) continue;
+                    float a = iv_j.t_min - iv_r.t_max;
+                    float b = iv_r.t_min - iv_j.t_max;
+                    float gap = max(max(a, b), 0.0);
+                    gap_total += gap;
+                }
+                float arclen_r = (r == 0) ? pc.arclength0 : ((r == 1) ? pc.arclength1 : pc.arclength2);
+                float pscore = gap_total - 0.1 * abs(t_mid);
+                if (arclen_r < 1.0) pscore = -1e9;
+                prs[ti][r] = pscore;
+            }
+        }
+        // 6 排列
+        const int perms[6][3] = int[6][3](
+            int[3](0,1,2), int[3](0,2,1), int[3](1,0,2),
+            int[3](1,2,0), int[3](2,0,1), int[3](2,1,0)
+        );
+        float best = -1e30;
+        int   best_p = 0;
+        for (int p = 0; p < 6; ++p) {
+            float total = prs[0][perms[p][0]] + prs[1][perms[p][1]] + prs[2][perms[p][2]];
+            if (total > best) { best = total; best_p = p; }
+        }
+        // 反投影 anchor
+        for (int ti = 0; ti < 3; ++ti) {
+            int route = perms[best_p][ti];
+            int idx   = g_top_idx[ti];
+            TileScore ts = tile_score.data[uint(idx)];
+            TilePca   pc = tile_pca  .data[uint(idx)];
+            ProjInterval iv = (route == 0) ? ts.iv0 : ((route == 1) ? ts.iv1 : ts.iv2);
+            float t_mid = 0.5 * (iv.t_min + iv.t_max);
+            vec2 anc = pc.mu + t_mid * pc.axis_u;
+            g_anchor      [route] = anc;
+            g_anchor_route[route] = idx;
+            g_anchor_valid[route] = true;
+        }
+    }
+    barrier();
+
+    // ============================================================
+    // Phase 3: 共线兜底（如果某路径还没 anchor）
+    //   per-route exclusive tile：cell.arclength[i] > kEps，其它路径 ≤ kEps
+    //   选 self_len 最大的 tile，anchor = 该路径在该 tile 内首个 sub_seg 中点
+    // ============================================================
+    bool any_missing_local = false;
+    if (lane == 0) {
+        for (int r = 0; r < ROUTE_COUNT; ++r) {
+            if (!g_anchor_valid[r]) { any_missing_local = true; break; }
+        }
+        if (any_missing_local) g_used_fallback = true;
+    }
+    barrier();
+
+    // 每 lane 局部最佳 per-route exclusive
+    float lex_len[3] = float[3](0.0, 0.0, 0.0);
+    int   lex_idx[3] = int[3](-1, -1, -1);
+    const float kOtherEps = 0.5;
+    for (int t = lane; t < n_tile; t += 64) {
+        // 三路径在该 tile 的弧长来自 tile_pca
+        float al0 = tile_pca.data[uint(t)].arclength0;
+        float al1 = tile_pca.data[uint(t)].arclength1;
+        float al2 = tile_pca.data[uint(t)].arclength2;
+        // 检查每路径是否独占
+        // route 0 独占
+        if (al0 > kOtherEps && al1 <= kOtherEps && al2 <= kOtherEps) {
+            if (al0 > lex_len[0]) { lex_len[0] = al0; lex_idx[0] = t; }
+        }
+        if (al1 > kOtherEps && al0 <= kOtherEps && al2 <= kOtherEps) {
+            if (al1 > lex_len[1]) { lex_len[1] = al1; lex_idx[1] = t; }
+        }
+        if (al2 > kOtherEps && al0 <= kOtherEps && al1 <= kOtherEps) {
+            if (al2 > lex_len[2]) { lex_len[2] = al2; lex_idx[2] = t; }
+        }
+    }
+    for (int r = 0; r < 3; ++r) {
+        s_excl_len[lane * 3 + r] = lex_len[r];
+        s_excl_idx[lane * 3 + r] = lex_idx[r];
+    }
+    barrier();
+
+    if (lane == 0) {
+        for (int r = 0; r < ROUTE_COUNT; ++r) {
+            if (g_anchor_valid[r]) continue;
+            // 在 64 lanes 中找最大
+            float best = 0.0;
+            int   best_idx = -1;
+            for (int k = 0; k < 64; ++k) {
+                float L = s_excl_len[k * 3 + r];
+                if (L > best) { best = L; best_idx = s_excl_idx[k * 3 + r]; }
+            }
+            if (best_idx < 0) continue;
+            // anchor = 该路径在该 tile 内首个 sub_seg 中点（扫全局池）
+            uint subseg_total = status_flags.data[1];
+            if (subseg_total > uint(MAX_SUBSEGS)) subseg_total = uint(MAX_SUBSEGS);
+            for (uint i = 0u; i < subseg_total; ++i) {
+                SubSeg ss = subseg_pool.data[i];
+                if (int(ss.tile_id) != best_idx) continue;
+                if (int(ss.route_id) != r) continue;
+                g_anchor      [r] = 0.5 * (ss.start + ss.end);
+                g_anchor_route[r] = best_idx;
+                g_anchor_valid[r] = true;
+                break;
+            }
+        }
+    }
+    barrier();
+
+    // ============================================================
+    // Phase 4: label 摆放 8 slot 校验（线程 0 串行，因为依赖前置 placed）
+    // ============================================================
+    if (lane == 0) {
+        // 摆放顺序：远离屏幕中心的先摆
+        vec2 sc_center = vec2(0.5 * P.screen_w, 0.5 * P.screen_h);
+        int order[3] = int[3](0, 1, 2);
+        // 简单选择排序
+        float rad[3];
+        for (int r = 0; r < 3; ++r) {
+            vec2 d = g_anchor[r] - sc_center;
+            rad[r] = length(d);
+        }
+        for (int i = 0; i < 2; ++i) {
+            int max_idx = i;
+            for (int j = i + 1; j < 3; ++j) {
+                if (rad[order[j]] > rad[order[max_idx]]) max_idx = j;
+            }
+            int tmp = order[i]; order[i] = order[max_idx]; order[max_idx] = tmp;
+        }
+
+        float diag = sqrt(P.label_w * P.label_w + P.label_h * P.label_h);
+        float dist = P.leader_len + 0.5 * diag;
+        const float kEdge       = 8.0;
+        const float kPanelPad   = 8.0;
+        const float kLabelPad   = 12.0;
+
+        bool has_panel = (P.panel_max_x > P.panel_min_x && P.panel_max_y > P.panel_min_y);
+        vec4 panel_inflated = vec4(P.panel_min_x - kPanelPad, P.panel_min_y - kPanelPad,
+                                   P.panel_max_x + kPanelPad, P.panel_max_y + kPanelPad);
+
+        for (int oi = 0; oi < 3; ++oi) {
+            int r = order[oi];
+            if (!g_anchor_valid[r]) {
+                g_label_status[r] = 2u;   // Infeasible
+                continue;
+            }
+            vec2 anc = g_anchor[r];
+
+            float best_cost = 1e30;
+            int   best_slot = -1;
+            vec2  best_cen  = vec2(0.0);
+            uint  best_status = 2u;
+
+            // 第一轮：硬约束完整
+            for (int s = 0; s < 8; ++s) {
+                vec2 dir = kSlotDir[s];
+                vec2 cen = anc + dir * dist;
+                vec4 L   = rect_aabb(cen, P.label_w, P.label_h);
+
+                // 屏幕边界
+                if (L.x < kEdge || L.z > P.screen_w - kEdge
+                 || L.y < kEdge || L.w > P.screen_h - kEdge) continue;
+
+                // 他路线段
+                if (label_hits_other_routes(L, r)) continue;
+
+                // panel
+                if (has_panel && aabb_intersects(L, panel_inflated)) continue;
+
+                // 已摆 label
+                bool overlap_placed = false;
+                for (int q = 0; q < g_placed_count; ++q) {
+                    vec4 inflated = inflate_aabb(g_placed_aabb[q], kLabelPad);
+                    if (aabb_intersects(L, inflated)) { overlap_placed = true; break; }
+                }
+                if (overlap_placed) continue;
+
+                // cost = lead - 0.05 * radial
+                float lead = length(cen - anc);
+                vec2  cv   = cen - sc_center;
+                float radial = length(cv);
+                float cost = lead - 0.05 * radial;
+                if (cost < best_cost) {
+                    best_cost   = cost;
+                    best_slot   = s;
+                    best_cen    = cen;
+                    best_status = 0u;   // Ok
+                }
+            }
+
+            // 第二轮兜底：放宽 placed 重叠（仍保留 panel + 边界 + 他路）
+            if (best_slot < 0) {
+                for (int s = 0; s < 8; ++s) {
+                    vec2 dir = kSlotDir[s];
+                    vec2 cen = anc + dir * dist;
+                    vec4 L   = rect_aabb(cen, P.label_w, P.label_h);
+                    if (L.x < kEdge || L.z > P.screen_w - kEdge
+                     || L.y < kEdge || L.w > P.screen_h - kEdge) continue;
+                    if (label_hits_other_routes(L, r)) continue;
+                    if (has_panel && aabb_intersects(L, panel_inflated)) continue;
+                    best_slot   = s;
+                    best_cen    = cen;
+                    best_status = 1u;   // FallbackUsed
+                    break;
+                }
+            }
+
+            // 第三轮兜底：放宽屏幕边界 + panel
+            if (best_slot < 0) {
+                for (int s = 0; s < 8; ++s) {
+                    vec2 dir = kSlotDir[s];
+                    vec2 cen = anc + dir * dist;
+                    vec4 L   = rect_aabb(cen, P.label_w, P.label_h);
+                    if (label_hits_other_routes(L, r)) continue;
+                    best_slot   = s;
+                    best_cen    = cen;
+                    best_status = 1u;   // FallbackUsed
+                    break;
+                }
+            }
+
+            if (best_slot >= 0) {
+                if (g_used_fallback && best_status == 0u) best_status = 1u;
+                g_label_center[r] = best_cen;
+                g_label_slot  [r] = uint(best_slot);
+                g_label_status[r] = best_status;
+                g_placed_aabb[g_placed_count] = rect_aabb(best_cen, P.label_w, P.label_h);
+                g_placed_count++;
+            } else {
+                g_label_status[r] = 2u;   // Infeasible
+            }
+        }
+
+        // ---- C3 互不重叠校验（标记 fallback，不强移）----
+        for (int i = 0; i < ROUTE_COUNT; ++i) {
+            if (g_label_status[i] == 2u) continue;
+            vec4 Li = rect_aabb(g_label_center[i], P.label_w, P.label_h);
+            for (int j = 0; j < i; ++j) {
+                if (g_label_status[j] == 2u) continue;
+                vec4 Lj = rect_aabb(g_label_center[j], P.label_w, P.label_h);
+                if (aabb_intersects(Li, Lj)) {
+                    g_label_status[i] = 1u;
+                    break;
+                }
+            }
+        }
+
+        // ---- 写 final_labels ----
+        for (int r = 0; r < ROUTE_COUNT; ++r) {
+            final_labels.data[r].anchor       = g_anchor[r];
+            final_labels.data[r].label_center = g_label_center[r];
+            final_labels.data[r].route_id     = uint(r);
+            final_labels.data[r].slot         = g_label_slot[r];
+            final_labels.data[r].status       = g_label_status[r];
+            final_labels.data[r]._pad0        = 0u;
+        }
+
+        // 把 selected_tile_index 写到 status_flags[3..5]（debug overlay readback 用）
+        // 实际上我们通过 final_labels 已经能定位 anchor，但 GridDebugSnapshot.selected_tile_index
+        // 仍需要——放到一个独立 binding 更清晰，但本工程为了不再加 binding，复用 status_flags：
+        // 但 status_flags 只 4 个 uint，不够。这部分让 host 端遍历 tile_score 取 Top-3 即可。
+    }
+}

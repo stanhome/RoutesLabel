@@ -1,0 +1,60 @@
+#version 450
+//
+// shaders/grid_scan.comp
+// Stage 0：清零中间 buffer（每次 compute() 调用前必须执行一次）。
+//
+// 文档原始设计是 prefix scan（subseg_count → subseg_offset），但本工程采用了
+// "全局 pool atomicAdd append + tile_id 字段"的简化方案（grid_common.glsl §SubSeg），
+// 因此 prefix scan 暂时不需要。这个 shader 复用同一槽位做 zero-init，保持 5-stage 对称。
+//
+// 清零目标（每次 compute 调用都得重置）：
+//   - subseg_count[MAX_TILES * 3]  → 0
+//   - subseg_offset[MAX_TILES * 3] → 0（保留以兼容未来 prefix scan）
+//   - aabb_count[MAX_TILES]        → 0
+//   - aabb_offset[MAX_TILES]       → 0
+//   - tile_pca[t].valid            → 0（其它字段会被 stage B 覆盖）
+//   - tile_score[t].feasible       → 0（其它字段会被 stage C 覆盖）
+//   - status_flags[0..3]           → 0
+//   - final_labels[0..2].status    → Infeasible(2)
+//
+// Dispatch：(ceil(MAX_TILES/64), 1, 1)。每线程处理 1 个 tile。
+//
+#extension GL_GOOGLE_include_directive : require
+
+#include "grid_common.glsl"
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+void main() {
+    uint t = gl_GlobalInvocationID.x;
+
+    // 1. status_flags / final_labels：仅前 3 个线程负责
+    if (t == 0u) {
+        status_flags.data[0] = 0u;
+        status_flags.data[1] = 0u;
+        status_flags.data[2] = 0u;
+        status_flags.data[3] = 0u;
+    }
+    if (t < 3u) {
+        final_labels.data[t].anchor       = vec2(0.0);
+        final_labels.data[t].label_center = vec2(0.0);
+        final_labels.data[t].route_id     = t;
+        final_labels.data[t].slot         = 2u;   // E
+        final_labels.data[t].status       = 2u;   // Infeasible
+        final_labels.data[t]._pad0        = 0u;
+    }
+
+    if (t >= uint(MAX_TILES)) return;
+
+    // 2. count / offset
+    aabb_count.data [t] = 0u;
+    aabb_offset.data[t] = 0u;
+    for (uint r = 0u; r < uint(ROUTE_COUNT); ++r) {
+        subseg_count.data [t * uint(ROUTE_COUNT) + r] = 0u;
+        subseg_offset.data[t * uint(ROUTE_COUNT) + r] = 0u;
+    }
+
+    // 3. tile_pca[t].valid + tile_score[t].feasible
+    tile_pca.data  [t].valid    = 0u;
+    tile_score.data[t].feasible = 0u;
+}
