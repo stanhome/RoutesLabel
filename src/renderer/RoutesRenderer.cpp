@@ -27,6 +27,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <stdexcept>
 
@@ -176,7 +177,11 @@ void RoutesRenderer::recreate_swapchain() {
 // -----------------------------------------------------------------------------
 
 void RoutesRenderer::load_scene_and_upload() {
-    const auto json_path = utils::assets_dir() / "routes_demo.json";
+    std::filesystem::path json_path = utils::assets_dir() / "routes_demo.json";
+    if (const char* env_scene = std::getenv("ROUTES_SCENE")) {
+        json_path = env_scene;
+    }
+    LOG_INFO("[RoutesRenderer] scene JSON: " << json_path);
     auto data = utils::load_route_scene_from_json(json_path);
     scene_ = std::make_unique<RouteScene>(std::move(data));
     const RibbonMesh mesh = scene_->build_ribbon_mesh(kRibbonWidthPx);

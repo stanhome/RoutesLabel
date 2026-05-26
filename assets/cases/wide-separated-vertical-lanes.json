@@ -1,0 +1,95 @@
+{
+  "_case": {
+    "id": "wide-separated-vertical-lanes",
+    "description": "同 OD，中段三条竖向车道大幅拉开"
+  },
+  "_od": {
+    "start": {
+      "x": 960,
+      "y": 120
+    },
+    "end": {
+      "x": 960,
+      "y": 960
+    }
+  },
+  "_assert": {
+    "all_placed": true,
+    "no_mutual_overlap": true,
+    "min_label_center_distance": 200
+  },
+  "mapViewRect": {
+    "x": 0,
+    "y": 0,
+    "w": 1920,
+    "h": 1080
+  },
+  "routes": [
+    {
+      "routeId": 1,
+      "color": [
+        0.95,
+        0.4,
+        0.4
+      ],
+      "polyline": [
+        {
+          "x": 960,
+          "y": 120
+        },
+        {
+          "x": 120,
+          "y": 540
+        },
+        {
+          "x": 960,
+          "y": 960
+        }
+      ]
+    },
+    {
+      "routeId": 2,
+      "color": [
+        0.4,
+        0.8,
+        0.4
+      ],
+      "polyline": [
+        {
+          "x": 960,
+          "y": 120
+        },
+        {
+          "x": 960,
+          "y": 540
+        },
+        {
+          "x": 960,
+          "y": 960
+        }
+      ]
+    },
+    {
+      "routeId": 3,
+      "color": [
+        0.9,
+        0.8,
+        0.3
+      ],
+      "polyline": [
+        {
+          "x": 960,
+          "y": 120
+        },
+        {
+          "x": 1800,
+          "y": 540
+        },
+        {
+          "x": 960,
+          "y": 960
+        }
+      ]
+    }
+  ]
+}

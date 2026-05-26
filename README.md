@@ -180,6 +180,34 @@ ROUTES_VALIDATION=1 ./tools/run-linux.sh    # 强制开启 validation layer
 
 运行时 ImGui Debug 面板提供 `Backend: CPU | GPU` 切换；两者输出严格一致（GPU 是 CPU 的并行实现），可逐 tile 对比 separation / score / 主轴方向。
 
+### 5.5 Test cases
+
+三条路线 **同起点、同终点**，数据在 `assets/cases/*.json`。
+
+```bash
+cmake -S . -B build
+cmake --build build -j --target routes_label routes_label_cases
+./tools/run-cases.sh -v                 # headless 全部
+./tools/run-all-cases-visual.sh         # 打印每条 headless + GUI 命令
+```
+
+GUI 启动日志应含：`[RoutesRenderer] scene JSON: .../_active_case.json`。
+
+| stem | headless | GUI |
+|------|----------|-----|
+| `trunk-fork-rejoin-crowding` | `./tools/run-cases.sh -v trunk-fork-rejoin-crowding` | `./tools/run-case-visual.sh trunk-fork-rejoin-crowding` |
+| `three-routes-detour-same-od` | `./tools/run-cases.sh -v three-routes-detour-same-od` | `./tools/run-case-visual.sh three-routes-detour-same-od` |
+| `vertical-staggered-corridor` | `./tools/run-cases.sh -v vertical-staggered-corridor` | `./tools/run-case-visual.sh vertical-staggered-corridor` |
+| `parallel-horizontal-lanes` | `./tools/run-cases.sh -v parallel-horizontal-lanes` | `./tools/run-case-visual.sh parallel-horizontal-lanes` |
+| `car-marker-fork-detour` | `./tools/run-cases.sh -v car-marker-fork-detour` | `./tools/run-case-visual.sh car-marker-fork-detour` |
+| `diagonal-three-routes` | `./tools/run-cases.sh -v diagonal-three-routes` | `./tools/run-case-visual.sh diagonal-three-routes` |
+| `horizontal-trunk-vertical-legs` | `./tools/run-cases.sh -v horizontal-trunk-vertical-legs` | `./tools/run-case-visual.sh horizontal-trunk-vertical-legs` |
+| `wide-separated-vertical-lanes` | `./tools/run-cases.sh -v wide-separated-vertical-lanes` | `./tools/run-case-visual.sh wide-separated-vertical-lanes` |
+| `l-fork-three-branches` | `./tools/run-cases.sh -v l-fork-three-branches` | `./tools/run-case-visual.sh l-fork-three-branches` |
+| `dual-fork-top3-assign` | `./tools/run-cases.sh -v dual-fork-top3-assign` | `./tools/run-case-visual.sh dual-fork-top3-assign` |
+| `l-turn-parallel-offset` | `./tools/run-cases.sh -v l-turn-parallel-offset` | `./tools/run-case-visual.sh l-turn-parallel-offset` |
+| `dense-trunk-perf-scene` | `./tools/run-cases.sh -v dense-trunk-perf-scene` | `./tools/run-case-visual.sh dense-trunk-perf-scene` |
+
 ---
 
 ## 6. 目录结构
@@ -191,7 +219,10 @@ RoutesLabel/
 │   └── CompileShaders.cmake      GLSL → SPIR-V 编译辅助
 ├── tools/
 │   ├── run-mac.sh                macOS 运行包装（MoltenVK / Layer / dyld 路径）
-│   └── run-linux.sh              Linux 运行包装（LunarG SDK + validation 开关）
+│   ├── run-linux.sh              Linux 运行包装（LunarG SDK + validation 开关）
+│   ├── run-cases.sh              headless 跑 assets/cases
+│   ├── run-case-visual.sh        GUI 加载单个 case
+│   └── run-all-cases-visual.sh   列出全部 case 命令
 ├── third_party/
 │   ├── glfw/                     GLFW（submodule）
 │   └── glm/                      GLM（submodule）
@@ -219,7 +250,9 @@ RoutesLabel/
 │   │   ├── RoutesRenderer.{h,cpp} 路径绘制
 │   │   └── TriangleRenderer.{h,cpp} hello-triangle 自检
 │   ├── debug/                    ImGui overlay：Grid 热图 / PCA 主轴 / separation 直方图
-│   └── utils/                    Log / FileSystem 等
+│   ├── tools/RunCases.cpp        headless case runner（routes_label_cases）
+│   └── utils/                    Log / FileSystem / SceneAlgo 等
+├── assets/cases/                 label 回归 JSON（见 §5.5）
 └── doc/                          设计文档
 ```
 

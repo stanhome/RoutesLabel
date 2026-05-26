@@ -207,3 +207,36 @@ add_custom_command(TARGET routes_label POST_BUILD
     COMMENT "[RoutesLabel] copying assets/ to runtime dir"
     VERBATIM
 )
+
+# -----------------------------------------------------------------------------
+# Headless case runner (GridCpu + JSON cases, no Vulkan)
+# -----------------------------------------------------------------------------
+add_executable(routes_label_cases
+    src/tools/RunCases.cpp
+    src/algo/GridCpu.cpp
+    src/utils/Json.cpp
+    src/utils/SceneAlgo.cpp
+    src/utils/Log.cpp
+)
+
+target_include_directories(routes_label_cases PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+)
+
+target_link_libraries(routes_label_cases PRIVATE
+    nlohmann_json::nlohmann_json
+)
+
+target_compile_options(routes_label_cases PRIVATE
+    $<$<OR:$<CXX_COMPILER_ID:Clang>,$<CXX_COMPILER_ID:AppleClang>,$<CXX_COMPILER_ID:GNU>>:
+        -Wall -Wextra -Wpedantic -Wno-missing-field-initializers
+    >
+)
+
+add_custom_command(TARGET routes_label_cases POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_directory
+        ${CMAKE_CURRENT_SOURCE_DIR}/assets
+        ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/assets
+    COMMENT "[RoutesLabel] copying assets/ for routes_label_cases"
+    VERBATIM
+)
